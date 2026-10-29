@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 ppp = "2.3.0"
 dashmap = "6.2.1"
 rustc-hash = "2"
-ahash = "0.8"
+ahash = "0.8.12"
 cidr = "0.3"
 
 ferron-http = { path = "../types/http" }
