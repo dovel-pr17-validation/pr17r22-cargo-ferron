@@ -10,7 +10,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 arc-swap = "1.9.0"
 tokio-util = "0.7.18"
-anyhow = "1.0"
+anyhow = "1.0.104"
 chrono = "0.4"
 zincio = { version = "0.2.22", default-features = false, features = [
     "time",
