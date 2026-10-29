@@ -1,0 +1,22 @@
+[package]
+name = "ferron-admin-api"
+version = "3.0.0-rc.10"
+edition = "2021"
+
+[dependencies]
+http = "1"
+serde_json = "1.0"
+tokio = { version = "1", features = ["net", "rt", "sync", "macros"] }
+tokio-util = "0.7"
+arc-swap = "1.7"
+chrono = "0.4.44"
+subtle = "2.6.1"
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1.4"
+
+ferron-core = { path = "../../core" }
+ferron-observability = { path = "../../types/observability" }
+
+[lints]
+workspace = true

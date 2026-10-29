@@ -1,0 +1,279 @@
+//! W3C Trace Context support for distributed tracing.
+//!
+//! This module provides types and functions for parsing, generating, and
+//! injecting W3C `traceparent`, `tracestate`, and `baggage` headers.
+//! The [`TraceContext`] is stored in [`HttpContext::extensions`](crate::HttpContext::extensions)
+//! via the [`TraceContextKey`] and is available throughout the request pipeline.
+
+use http::header::HeaderValue;
+use http::HeaderMap;
+use rand::Rng;
+
+/// A W3C Trace Context representation for distributed tracing.
+///
+/// Carries trace ID, span ID, sampling decision, and optional baggage
+/// and tracestate values. Used to propagate context across service boundaries.
+#[derive(Debug, Clone)]
+pub struct TraceContext {
+    /// 32-character lowercase hex trace ID.
+    pub trace_id: String,
+    /// 16-character lowercase hex span ID.
+    pub span_id: String,
+    /// Whether this span should be sampled.
+    pub sampled: bool,
+    /// Optional W3C Baggage value.
+    pub baggage: Option<String>,
+    /// Optional W3C Tracestate value.
+    pub tracestate: Option<String>,
+}
+
+#[inline]
+fn is_hex(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Parse a `traceparent` header value into TraceContext (without tracestate).
+#[inline]
+pub fn parse_traceparent(s: &str) -> Option<TraceContext> {
+    // Expected format: version-traceid-parentid-flags
+    let parts: Vec<&str> = s.trim().split('-').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let (_version, trace_id, parent_id, flags) = (parts[0], parts[1], parts[2], parts[3]);
+    if trace_id.len() != 32 || parent_id.len() != 16 || flags.len() != 2 {
+        return None;
+    }
+    if !is_hex(trace_id) || !is_hex(parent_id) || !is_hex(flags) {
+        return None;
+    }
+    let flags_val = u8::from_str_radix(flags, 16).ok()?;
+    let sampled = (flags_val & 0x01) == 0x01;
+    Some(TraceContext {
+        trace_id: trace_id.to_lowercase(),
+        span_id: parent_id.to_lowercase(),
+        sampled,
+        baggage: None,
+        tracestate: None,
+    })
+}
+
+/// Generate a new random span ID as 16 lowercase hex characters.
+#[inline]
+pub fn generate_span_id() -> String {
+    let mut rng = rand::rng();
+    let mut span_bytes = [0u8; 8];
+    rng.fill_bytes(&mut span_bytes);
+    hex::encode(span_bytes)
+}
+
+/// Generate a new traceparent TraceContext (version 00) with random ids.
+#[inline]
+pub fn generate_traceparent(sampled: bool) -> TraceContext {
+    let mut rng = rand::rng();
+    let mut trace_bytes = [0u8; 16];
+    rng.fill_bytes(&mut trace_bytes);
+    TraceContext {
+        trace_id: hex::encode(trace_bytes),
+        span_id: generate_span_id(),
+        baggage: None,
+        sampled,
+        tracestate: None,
+    }
+}
+
+/// Format a TraceContext into a traceparent header value.
+pub fn format_traceparent(tc: &TraceContext) -> String {
+    let flags = if tc.sampled { 1u8 } else { 0u8 };
+    format!("00-{}-{}-{:02x}", tc.trace_id, tc.span_id, flags)
+}
+
+/// Build a W3C `tracestate` value carrying the OpenTelemetry sampling probability.
+///
+/// Backends use `ot` to extrapolate counts from traces that were only partially
+/// sampled. Without it, a trace sampled at 10% reports one request per stored
+/// trace and the totals silently disagree with the unsampled metrics.
+///
+/// Returns `None` when there is nothing to report: probabilities of `1.0` drop
+/// no traces, and anything outside `(0.0, 1.0)` or non-finite is rejected rather
+/// than written as a value a backend would have to guess about.
+pub fn format_sampling_tracestate(probability: f64) -> Option<String> {
+    if !(probability > 0.0 && probability < 1.0) || !probability.is_finite() {
+        return None;
+    }
+    // Render with enough precision to round-trip a typical ratio, then drop
+    // trailing zeros so `0.10000000000000001` does not become a long literal.
+    let mut rendered = format!("{probability:.6}");
+    if rendered.contains('.') {
+        rendered = rendered
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string();
+    }
+    Some(format!("ot={rendered}"))
+}
+
+/// Inject trace headers into an http HeaderMap
+pub fn inject_trace_headers(headers: &mut HeaderMap, tc: &TraceContext) {
+    // Sanitize existing traceparent/tracestate/baggage headers before injecting new ones.
+    headers.remove("traceparent");
+    headers.remove("tracestate");
+    headers.remove("baggage");
+
+    let tp = format_traceparent(tc);
+    if let Ok(v) = HeaderValue::from_str(&tp) {
+        headers.insert("traceparent", v);
+    }
+    if let Some(ts) = &tc.tracestate {
+        if let Ok(v) = HeaderValue::from_str(ts) {
+            headers.insert("tracestate", v);
+        }
+    }
+    if let Some(b) = &tc.baggage {
+        if let Ok(v) = HeaderValue::from_str(b) {
+            headers.insert("baggage", v);
+        }
+    }
+}
+
+use typemap_rev::TypeMapKey;
+
+/// TypeMap key for storing a [`TraceContext`] in [`HttpContext::extensions`](crate::HttpContext::extensions).
+pub struct TraceContextKey;
+impl TypeMapKey for TraceContextKey {
+    /// The stored value is a [`TraceContext`].
+    type Value = TraceContext;
+}
+
+/// Convert a request trace context into an observability event trace context.
+pub fn to_event_trace_context(
+    trace_context: &TraceContext,
+) -> ferron_observability::EventTraceContext {
+    let trace_id: [u8; 32] = trace_context
+        .trace_id
+        .as_bytes()
+        .try_into()
+        .expect("trace_id must be 32 hex chars");
+    let span_id: [u8; 16] = trace_context
+        .span_id
+        .as_bytes()
+        .try_into()
+        .expect("span_id must be 16 hex chars");
+    let baggage = trace_context.baggage.clone();
+    let tracestate = trace_context.tracestate.clone();
+    ferron_observability::EventTraceContext {
+        trace_id,
+        span_id,
+        baggage,
+        tracestate,
+        sampled: Some(trace_context.sampled),
+    }
+}
+
+/// Return the current request trace context from an HTTP context, if available.
+pub fn current_event_trace_context(
+    ctx: &crate::HttpContext,
+) -> Option<ferron_observability::EventTraceContext> {
+    ctx.get::<TraceContextKey>().map(to_event_trace_context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_valid_traceparent() {
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let tc = parse_traceparent(tp).unwrap();
+        assert_eq!(tc.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(tc.span_id, "00f067aa0ba902b7");
+        assert!(tc.sampled);
+    }
+
+    #[test]
+    fn test_parse_invalid_traceparent() {
+        assert!(parse_traceparent("invalid").is_none());
+        assert!(parse_traceparent("00-short-00f067aa0ba902b7-01").is_none());
+        assert!(parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-short-01").is_none());
+        assert!(
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-xx").is_none()
+        );
+    }
+
+    #[test]
+    fn test_format_traceparent() {
+        let tc = TraceContext {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            span_id: "00f067aa0ba902b7".to_string(),
+            sampled: true,
+            baggage: None,
+            tracestate: None,
+        };
+        let formatted = format_traceparent(&tc);
+        assert_eq!(
+            formatted,
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+    }
+
+    #[test]
+    fn test_generate_traceparent() {
+        let tc = generate_traceparent(true);
+        assert_eq!(tc.trace_id.len(), 32);
+        assert_eq!(tc.span_id.len(), 16);
+        assert!(tc.sampled);
+        assert!(is_hex(&tc.trace_id));
+        assert!(is_hex(&tc.span_id));
+    }
+
+    #[test]
+    fn test_format_sampling_tracestate() {
+        assert_eq!(format_sampling_tracestate(0.1), Some("ot=0.1".to_string()));
+        assert_eq!(
+            format_sampling_tracestate(0.25),
+            Some("ot=0.25".to_string())
+        );
+        assert_eq!(
+            format_sampling_tracestate(0.001),
+            Some("ot=0.001".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_sampling_tracestate_skips_uninformative_values() {
+        // 1.0 drops no traces, so there is nothing to extrapolate.
+        assert_eq!(format_sampling_tracestate(1.0), None);
+        // 0.0 means no trace is sampled at all.
+        assert_eq!(format_sampling_tracestate(0.0), None);
+        // Out-of-range and non-finite values would be a guess, not a probability.
+        assert_eq!(format_sampling_tracestate(1.5), None);
+        assert_eq!(format_sampling_tracestate(-0.1), None);
+        assert_eq!(format_sampling_tracestate(f64::NAN), None);
+        assert_eq!(format_sampling_tracestate(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn test_inject_trace_headers() {
+        let mut headers = HeaderMap::new();
+        let tc = TraceContext {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            span_id: "00f067aa0ba902b7".to_string(),
+            sampled: false,
+            baggage: Some("key=value".to_string()),
+            tracestate: Some("conntype=1".to_string()),
+        };
+        inject_trace_headers(&mut headers, &tc);
+        assert_eq!(
+            headers.get("traceparent").unwrap().to_str().unwrap(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
+        );
+        assert_eq!(
+            headers.get("tracestate").unwrap().to_str().unwrap(),
+            "conntype=1"
+        );
+        assert_eq!(
+            headers.get("baggage").unwrap().to_str().unwrap(),
+            "key=value"
+        );
+    }
+}

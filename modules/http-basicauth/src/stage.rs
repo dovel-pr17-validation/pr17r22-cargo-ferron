@@ -1,0 +1,511 @@
+//! HTTP Basic Authentication pipeline stage.
+//!
+//! Intercepts requests and validates the `Authorization: Basic` header against
+//! configured users. Returns 401 for regular requests and 407 for CONNECT
+//! requests when authentication fails.
+
+use std::sync::{Arc, LazyLock};
+
+use dashmap::DashMap;
+use ferron_core::pipeline::{PipelineError, Stage};
+use ferron_core::registry::StageConstraint;
+use ferron_http::abuse::{get_global_abuse_recorder, AbuseEvent, AbuseEventType};
+use ferron_http::access_log::{custom_access_log_fields, CustomAccessLogField};
+use ferron_http::span::HttpContextSpanExt;
+use ferron_http::{HttpContext, HttpResponse};
+use ferron_observability::{Event, LogAttributeValue, LogEvent, LogLevel, TraceAttributeValue};
+use http::{HeaderMap, HeaderValue, Method};
+use rustc_hash::FxBuildHasher;
+use tokio::sync::Semaphore;
+
+use crate::brute_force::{BruteForceConfig, BruteForceEngine};
+use crate::config::parse_basicauth_config;
+
+/// A fake hash used to thwart user enumeration attacks.
+/// This hash is a valid, hard-coded PBKDF2 hash for a "fake" password.
+pub(crate) const FAKE_HASH: &str = "$pbkdf2-sha256$600000$\
+    qeYaak0VoUEgPTiMip6vZw$n5YRg40xhu3Pl3FQ2lZ1GfhG9YSPVZM0b7iODMzWtM0";
+
+pub(crate) static GLOBAL_CONCURRENCY_SEMAPHORE: LazyLock<
+    tokio::sync::RwLock<Option<Arc<Semaphore>>>,
+> = LazyLock::new(|| tokio::sync::RwLock::new(None));
+
+/// Pipeline stage that enforces HTTP Basic Authentication.
+pub struct BasicAuthStage {
+    /// A map of cached brute force engines
+    engines: DashMap<BruteForceConfig, BruteForceEngine, FxBuildHasher>,
+}
+
+impl BasicAuthStage {
+    /// Create a new basic auth stage with the shared engine.
+    pub fn new() -> Self {
+        Self {
+            engines: DashMap::with_hasher(FxBuildHasher),
+        }
+    }
+
+    /// Extract the username from a Basic auth header value.
+    ///
+    /// The value is expected to be `Basic <base64(username:password)>`.
+    fn parse_basic_auth_header(value: &str) -> Option<(String, String)> {
+        if value.len() < 6 {
+            return None;
+        }
+
+        let (scheme, rest) = value.split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("Basic") {
+            return None;
+        }
+
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, rest.trim()).ok()?;
+        let credentials = String::from_utf8(decoded).ok()?;
+
+        let (username, password) = credentials.split_once(':')?;
+        Some((username.to_string(), password.to_string()))
+    }
+
+    /// Verify a password against a stored hash.
+    async fn verify_password(plain: &str, hash: &str) -> bool {
+        let plain = plain.to_string();
+        let hash = hash.to_string();
+        let sem = GLOBAL_CONCURRENCY_SEMAPHORE.read().await.clone();
+        let _permit = if let Some(sem) = sem {
+            sem.acquire_owned().await.ok()
+        } else {
+            None
+        };
+        let result =
+            zincio::spawn_blocking(move || crate::password_hash::verify_password(&plain, &hash))
+                .await
+                .unwrap_or(false);
+        drop(_permit);
+        result
+    }
+
+    /// Build an authentication challenge response.
+    ///
+    /// For CONNECT requests, returns 407 Proxy Authentication Required.
+    /// For all other requests, returns 401 Unauthorized.
+    fn make_auth_challenge_response(ctx: &HttpContext, realm: &str) -> HttpResponse {
+        let is_connect = ctx
+            .req
+            .as_ref()
+            .map(|r| r.method() == Method::CONNECT)
+            .unwrap_or(false);
+
+        let status = if is_connect { 407 } else { 401 };
+        let header_name = if is_connect {
+            http::header::PROXY_AUTHENTICATE
+        } else {
+            http::header::WWW_AUTHENTICATE
+        };
+
+        let challenge = format!("Basic realm=\"{realm}\", charset=\"UTF-8\"");
+        let mut headers = HeaderMap::new();
+        // The realm is operator supplied and is embedded in the challenge, so it
+        // can make the challenge unusable as a header even though `ferron
+        // validate` rejects an unusable configured value. Answer without a
+        // challenge rather than failing the response.
+        match HeaderValue::from_str(&challenge) {
+            Ok(value) => {
+                headers.insert(header_name, value);
+            }
+            Err(_) => {
+                // The configured `realm` makes the authentication challenge invalid.
+            }
+        }
+
+        HttpResponse::BuiltinError(status, Some(headers))
+    }
+
+    /// Build a lockout response (IP temporarily locked due to brute-force protection).
+    fn make_lockout_response(ctx: &HttpContext, engine: &BruteForceEngine) -> HttpResponse {
+        let retry_after = ctx.remote_address.and_then(|a| engine.retry_after(a.ip()));
+        let mut header_map = HeaderMap::new();
+        if let Some(duration) = retry_after {
+            header_map.insert(
+                http::header::RETRY_AFTER,
+                HeaderValue::from_str(&duration.as_secs().to_string())
+                    .expect("retry-after value should be valid header value"),
+            );
+        }
+
+        HttpResponse::BuiltinError(429, Some(header_map))
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Stage<HttpContext> for BasicAuthStage {
+    fn name(&self) -> &str {
+        "basicauth"
+    }
+
+    fn constraints(&self) -> Vec<StageConstraint> {
+        vec![
+            StageConstraint::After("client_ip_from_header".to_string()),
+            StageConstraint::Before("forward_proxy".to_string()),
+            StageConstraint::Before("reverse_proxy".to_string()),
+        ]
+    }
+
+    fn is_applicable(
+        &self,
+        config: Option<&ferron_core::config::ServerConfigurationBlock>,
+    ) -> bool {
+        config.is_some_and(|c| c.has_directive("basic_auth"))
+    }
+
+    #[inline]
+    async fn run(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        let config = match parse_basicauth_config(&ctx.configuration, ctx) {
+            Some(cfg) => cfg,
+            None => return Ok(true), // No basicauth configured: pass through
+        };
+
+        let engine = if let Some(engine) = self.engines.get(&config.brute_force) {
+            engine
+        } else {
+            self.engines
+                .entry(config.brute_force.clone())
+                .or_insert_with(|| BruteForceEngine::new(config.brute_force.clone()))
+                .downgrade()
+        };
+
+        let auth_header = ctx
+            .req
+            .as_ref()
+            .and_then(|req| req.headers().get(http::header::AUTHORIZATION))
+            .and_then(|v| v.to_str().ok());
+
+        let auth_header = match auth_header {
+            Some(h) => h,
+            None => {
+                // No credentials provided
+                ctx.res = Some(Self::make_auth_challenge_response(ctx, &config.realm));
+                ctx.get_span_attributes().insert(
+                    "ferron.basicauth.result",
+                    TraceAttributeValue::StaticStr("skip"),
+                );
+                custom_access_log_fields(ctx).insert(
+                    "ferron.basicauth.result".into(),
+                    CustomAccessLogField::String("skip".into()),
+                );
+                return Ok(false);
+            }
+        };
+
+        let (username, password) = match Self::parse_basic_auth_header(auth_header) {
+            Some(parts) => parts,
+            None => {
+                // Malformed credentials
+                ctx.res = Some(Self::make_auth_challenge_response(ctx, &config.realm));
+                ctx.get_span_attributes().insert(
+                    "ferron.basicauth.result",
+                    TraceAttributeValue::StaticStr("failure"),
+                );
+                ctx.get_span_attributes()
+                    .insert("error.type", TraceAttributeValue::StaticStr("auth_failed"));
+                custom_access_log_fields(ctx).insert(
+                    "ferron.basicauth.result".into(),
+                    CustomAccessLogField::String("failure".into()),
+                );
+                return Ok(false);
+            }
+        };
+        let ip = ctx.remote_address.map(|a| a.ip().to_canonical());
+
+        // Only apply IP-based brute-force protection when a client IP is known
+        // (e.g. not for Unix socket listeners, which have no remote address).
+        if let Some(ip) = ip {
+            if engine.is_locked(ip) {
+                ctx.events.emit(Event::Log(LogEvent {
+                    level: LogLevel::Warn,
+                    message: format!("basicauth: IP '{ip}' locked (brute-force protection)"),
+                    summary: "Basic auth client locked".into(),
+                    target: "ferron-http-basicauth",
+                    attributes: vec![("client.address", LogAttributeValue::String(ip.to_string()))],
+                    trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+                }));
+                ctx.res = Some(Self::make_lockout_response(ctx, &engine));
+                ctx.get_span_attributes().insert(
+                    "ferron.basicauth.result",
+                    TraceAttributeValue::StaticStr("failure"),
+                );
+                ctx.get_span_attributes()
+                    .insert("error.type", TraceAttributeValue::StaticStr("auth_failed"));
+                custom_access_log_fields(ctx).insert(
+                    "ferron.basicauth.result".into(),
+                    CustomAccessLogField::String("failure".into()),
+                );
+                return Ok(false);
+            }
+        }
+
+        let stored_hash = match config.users.get(&username) {
+            Some(hash) => hash,
+            None => {
+                // Verify a fake hash to thwart user enumeration
+                let _ = Self::verify_password("test", FAKE_HASH).await;
+
+                if let Some(ip) = ip {
+                    engine.record_failure(ip);
+                    if let Some(recorder) = get_global_abuse_recorder() {
+                        let abuse_event = AbuseEvent::new(
+                            AbuseEventType::BruteForceFailure,
+                            ip,
+                            format!("Brute-force failure for unknown user '{}'", username),
+                            60,
+                        );
+                        recorder.record_event(&abuse_event, ctx);
+                    }
+                }
+                ctx.events.emit(Event::Log(LogEvent {
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "basicauth: authentication failed for unknown user '{}'",
+                        username
+                    ),
+                    summary: "Basic auth failed for unknown user".into(),
+                    target: "ferron-http-basicauth",
+                    attributes: vec![("user.name", LogAttributeValue::String(username.clone()))],
+                    trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+                }));
+                ctx.res = Some(Self::make_auth_challenge_response(ctx, &config.realm));
+                ctx.get_span_attributes().insert(
+                    "ferron.basicauth.result",
+                    TraceAttributeValue::StaticStr("failure"),
+                );
+                ctx.get_span_attributes()
+                    .insert("error.type", TraceAttributeValue::StaticStr("auth_failed"));
+                custom_access_log_fields(ctx).insert(
+                    "ferron.basicauth.result".into(),
+                    CustomAccessLogField::String("failure".into()),
+                );
+                return Ok(false);
+            }
+        };
+
+        if Self::verify_password(&password, stored_hash).await {
+            ctx.events.emit(Event::Log(LogEvent {
+                level: LogLevel::Debug,
+                message: format!("basicauth: user '{}' authenticated successfully", username),
+                summary: "Basic auth succeeded".into(),
+                target: "ferron-http-basicauth",
+                attributes: vec![("user.name", LogAttributeValue::String(username.clone()))],
+                trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+            }));
+            ctx.auth_user = Some(username.clone());
+            ctx.get_span_attributes().insert(
+                "ferron.basicauth.result",
+                TraceAttributeValue::StaticStr("success"),
+            );
+            ctx.get_span_attributes()
+                .insert("user.name", TraceAttributeValue::String(username));
+            custom_access_log_fields(ctx).insert(
+                "ferron.basicauth.result".into(),
+                CustomAccessLogField::String("success".into()),
+            );
+            Ok(true)
+        } else {
+            // Authentication failed
+            let locked = ip.is_some_and(|ip| engine.record_failure(ip));
+            if let Some(ip) = ip {
+                if let Some(recorder) = get_global_abuse_recorder() {
+                    let abuse_event = AbuseEvent::new(
+                        AbuseEventType::BruteForceFailure,
+                        ip,
+                        format!("Brute-force failure for user '{}'", username),
+                        60,
+                    );
+                    recorder.record_event(&abuse_event, ctx);
+                }
+            }
+            let client_ip_str = ip.map(|ip| ip.to_string()).unwrap_or_default();
+            ctx.events.emit(Event::Log(LogEvent {
+                level: LogLevel::Warn,
+                message: format!(
+                    "basicauth: authentication failed for user '{}'{}",
+                    username,
+                    if locked {
+                        format!(" (client {client_ip_str} now locked)")
+                    } else {
+                        "".to_string()
+                    }
+                ),
+                summary: "Basic auth failed".into(),
+                target: "ferron-http-basicauth",
+                attributes: vec![
+                    ("user.name", LogAttributeValue::String(username.clone())),
+                    ("client.address", LogAttributeValue::String(client_ip_str)),
+                    ("ferron.basicauth.locked", LogAttributeValue::Bool(locked)),
+                ],
+                trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+            }));
+            ctx.res = Some(Self::make_auth_challenge_response(ctx, &config.realm));
+            ctx.get_span_attributes().insert(
+                "ferron.basicauth.result",
+                TraceAttributeValue::StaticStr("failure"),
+            );
+            ctx.get_span_attributes()
+                .insert("error.type", TraceAttributeValue::StaticStr("auth_failed"));
+            custom_access_log_fields(ctx).insert(
+                "ferron.basicauth.result".into(),
+                CustomAccessLogField::String("failure".into()),
+            );
+            Ok(false)
+        }
+    }
+}
+
+impl Default for BasicAuthStage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use bytes::Bytes;
+    use ferron_core::config::layer::LayeredConfiguration;
+    use ferron_core::config::{
+        ServerConfigurationBlock, ServerConfigurationDirectiveEntry, ServerConfigurationValue,
+    };
+    use ferron_http::HttpRequest;
+    use ferron_observability::CompositeEventSink;
+    use http::Request;
+    use http_body_util::{BodyExt, Empty};
+    use rustc_hash::FxHashMap;
+    use std::sync::Arc;
+
+    fn make_test_context_with_auth_header(
+        auth_header: Option<&str>,
+        config: Option<LayeredConfiguration>,
+    ) -> HttpContext {
+        let mut builder = Request::builder().uri("/path");
+        if let Some(auth) = auth_header {
+            builder = builder.header(http::header::AUTHORIZATION, auth);
+        }
+        let req: HttpRequest = builder
+            .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync())
+            .unwrap();
+
+        let mut ctx = HttpContext::default();
+        ctx.req = Some(req);
+        ctx.events = CompositeEventSink::new(Vec::new());
+        ctx.configuration = config.unwrap_or_default();
+        ctx.encrypted = false;
+        ctx.local_address = Some("0.0.0.0:80".parse().unwrap());
+        ctx.remote_address = Some("192.0.2.1:12345".parse().unwrap());
+        ctx
+    }
+
+    fn make_basicauth_config(users: Vec<(&str, &str)>) -> LayeredConfiguration {
+        let mut inner_directives = FxHashMap::default();
+
+        let mut users_block_directives = FxHashMap::default();
+        for (username, hash) in users {
+            users_block_directives.insert(
+                username.to_string(),
+                vec![ServerConfigurationDirectiveEntry {
+                    args: vec![ServerConfigurationValue::String(hash.to_string(), None)],
+                    children: None,
+                    span: None,
+                }],
+            );
+        }
+
+        inner_directives.insert(
+            "users".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![],
+                children: Some(ServerConfigurationBlock {
+                    directives: Arc::new(users_block_directives),
+                    matchers: FxHashMap::default(),
+                    span: None,
+                }),
+                span: None,
+            }],
+        );
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "basic_auth".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![],
+                children: Some(ServerConfigurationBlock {
+                    directives: Arc::new(inner_directives),
+                    matchers: FxHashMap::default(),
+                    span: None,
+                }),
+                span: None,
+            }],
+        );
+
+        let mut config = LayeredConfiguration::new();
+        config.add_layer(Arc::new(ServerConfigurationBlock {
+            directives: Arc::new(directives),
+            matchers: FxHashMap::default(),
+            span: None,
+        }));
+        config
+    }
+
+    fn make_basic_auth_header(username: &str, password: &str) -> String {
+        let credentials = format!("{username}:{password}");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+        format!("Basic {encoded}")
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_auth_header() {
+        let stage = BasicAuthStage::new();
+        let config = make_basicauth_config(vec![("alice", "$argon2id$v=19$m=19456,t=2,p=1$abc")]);
+
+        let mut ctx = make_test_context_with_auth_header(None, Some(config));
+        let result = stage.run(&mut ctx).await.unwrap();
+
+        assert!(!result, "should stop pipeline");
+        assert!(ctx.res.is_some());
+    }
+
+    #[test]
+    fn rejects_unknown_user() {
+        // Had to use `zincio`, since this test uses zincio::spawn_blocking,
+        // which would fail on Tokio.
+        let rt = zincio::RuntimeBuilder::new()
+            .driver(zincio::DriverKind::Mock)
+            .default_blocking_pool(64)
+            .build()
+            .expect("failed to build runtime");
+        rt.block_on(async move {
+            let stage = BasicAuthStage::new();
+            let config =
+                make_basicauth_config(vec![("alice", "$argon2id$v=19$m=19456,t=2,p=1$abc")]);
+
+            let auth_header = make_basic_auth_header("bob", "somepassword");
+            let mut ctx = make_test_context_with_auth_header(Some(&auth_header), Some(config));
+            let result = stage.run(&mut ctx).await.unwrap();
+
+            assert!(!result, "should stop pipeline");
+            assert!(ctx.res.is_some());
+        });
+    }
+
+    #[test]
+    fn parses_basic_auth_header_correctly() {
+        let header = make_basic_auth_header("alice", "secret123");
+        let (user, pass) = BasicAuthStage::parse_basic_auth_header(&header).unwrap();
+        assert_eq!(user, "alice");
+        assert_eq!(pass, "secret123");
+    }
+
+    #[test]
+    fn rejects_malformed_auth_header() {
+        assert!(BasicAuthStage::parse_basic_auth_header("InvalidFormat").is_none());
+        assert!(BasicAuthStage::parse_basic_auth_header("Basic not-base64!!!").is_none());
+        assert!(BasicAuthStage::parse_basic_auth_header("Basic bm9jb2xvbg==").is_none());
+    }
+}

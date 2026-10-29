@@ -1,0 +1,368 @@
+# shellcheck shell=sh
+#
+# 00_preflight.sh — host detection and install method selection.
+#
+# This is the most complex step because it sets up the environment for every
+# subsequent step. It runs first and exports variables that control the rest
+# of the installer.
+#
+# Detection performed:
+#   - Root / elevated privileges
+#   - Distro name and version (from /etc/os-release, /etc/redhat-release, etc.)
+#   - CPU architecture normalized to a target-triple component
+#   - C library (glibc vs musl) for Linux
+#   - Active init system (systemd vs SysV)
+#   - Existing Ferron installation (via installer or package manager)
+#
+# User interaction:
+#   - Asks for install method: archive, Debian/Ubuntu APT, RHEL/Fedora DNF, etc.
+#   - If an existing installer-managed install is found, offers update / uninstall
+#
+# Key variables exported:
+#   FERRON_DISTRO          — distro name (debian, rhel, alpine, freebsd, unknown)
+#   FERRON_DISTRO_VERSION  — distro version or codename
+#   FERRON_DISTRO_CODENAME — distro codename or version
+#   FERRON_ARCH            — normalized architecture (x86_64, aarch64, armv7, …)
+#   FERRON_LIBC            — libc variant for Linux (gnu, musl, or empty)
+#   FERRON_TARGET_TRIPLE   — full triple used in download URLs
+#   FERRON_HAS_SYSTEMD     — 1 if systemd is active, 0 otherwise
+#   FERRON_HAS_OPENRC      — 1 if OpenRC is active, 0 otherwise
+#   FERRON_INSTALL_METHOD  — archive, debian, rhel, alpine, freebsd
+#   FERRON_INSTALL_MODE    — install, update, uninstall
+#   FERRON_INSTALL_LTS     — 1 if LTS channel is requested
+#   FERRON_ARCHIVE_PATH    — path to downloaded or local archive (archive mode)
+
+step_preflight() {
+    # ------------------------------------------------------------------
+    # 1. Root check
+    # ------------------------------------------------------------------
+    if [ "$(id -u)" != "0" ]; then
+        log_write "error: this installer must be run as root"
+        printf '%sError: the installer must be run as root (or with sudo).%s\n' \
+            "$(printf '\033[1m')" "$(printf '\033[0m')" >&2
+        return 1
+    fi
+    log_write "root check passed"
+
+    # ------------------------------------------------------------------
+    # 2. Distro detection
+    # ------------------------------------------------------------------
+    FERRON_DISTRO="unknown"
+    FERRON_DISTRO_VERSION=""
+    FERRON_DISTRO_CODENAME=""
+
+    # Try /etc/os-release first (systemd-based distros, modern distros).
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1090
+        . /etc/os-release
+        case "${ID:-}" in
+            debian|ubuntu|devuan|mx|pop|elementary|linuxmint)
+                FERRON_DISTRO="debian" ;;
+            rhel|fedora|centos|rocky|almalinux|amzn|oracle|scientific)
+                FERRON_DISTRO="rhel" ;;
+            alpine)
+                FERRON_DISTRO="alpine" ;;
+            arch)
+                FERRON_DISTRO="arch" ;;
+            freebsd)
+                FERRON_DISTRO="freebsd" ;;
+        esac
+        FERRON_DISTRO_VERSION="${VERSION_ID:-${VERSION_CODENAME:-}}"
+        FERRON_DISTRO_CODENAME="${VERSION_CODENAME:-${VERSION_ID:-}}"
+    fi
+
+    # Fallback: check /etc/redhat-release.
+    if [ "$FERRON_DISTRO" = "unknown" ] && [ -r /etc/redhat-release ]; then
+        if grep -qi 'red hat\|rhel\|enterprise' /etc/redhat-release 2>/dev/null; then
+            FERRON_DISTRO="rhel"
+        elif grep -qi 'fedora' /etc/redhat-release 2>/dev/null; then
+            FERRON_DISTRO="fedora"
+        elif grep -qi 'centos' /etc/redhat-release 2>/dev/null; then
+            FERRON_DISTRO="centos"
+        fi
+        FERRON_DISTRO_VERSION=$(grep -oE '[0-9]+(\.[0-9]+)*' /etc/redhat-release 2>/dev/null | head -1)
+        FERRON_DISTRO_CODENAME="$FERRON_DISTRO_VERSION"
+    fi
+
+    # Fallback: check lsb_release.
+    if [ "$FERRON_DISTRO" = "unknown" ] && command -v lsb_release >/dev/null 2>&1; then
+        _lsb_id=$(lsb_release -si 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        case "$_lsb_id" in
+            debian|ubuntu|devuan) FERRON_DISTRO="debian" ;;
+            redhat|fedora|centos) FERRON_DISTRO="rhel" ;;
+            alpine)               FERRON_DISTRO="alpine" ;;
+            arch)                 FERRON_DISTRO="arch" ;;
+            freebsd)              FERRON_DISTRO="freebsd" ;;
+        esac
+        _lsb_rel=$(lsb_release -sr 2>/dev/null)
+        _lsb_cdn=$(lsb_release -cs 2>/dev/null)
+        [ -n "$_lsb_rel" ] && FERRON_DISTRO_VERSION="$_lsb_rel"
+        [ -n "$_lsb_cdn" ] && FERRON_DISTRO_CODENAME="$_lsb_cdn"
+    fi
+
+    # Fallback check if arch_release exists.
+    if [ "$FERRON_DISTRO" = "unknown" ] && [ -f /etc/arch-release ]; then
+        FERRON_DISTRO="arch"
+    fi
+
+    # Final fallback: just use the hostname's first word.
+    if [ "$FERRON_DISTRO" = "unknown" ]; then
+        log_write "warning: could not detect distro, defaulting to unknown"
+    else
+        log_write "detected distro: $FERRON_DISTRO $FERRON_DISTRO_VERSION"
+    fi
+
+    # ------------------------------------------------------------------
+    # 3. Architecture detection
+    # ------------------------------------------------------------------
+    _uname_arch=$(uname -m 2>/dev/null || echo "unknown")
+    case "$_uname_arch" in
+        x86_64|amd64)    FERRON_ARCH="x86_64" ;;
+        aarch64|arm64)    FERRON_ARCH="aarch64" ;;
+        armv7l|armv7)     FERRON_ARCH="armv7" ;;
+        armv6l)           FERRON_ARCH="armv6" ;;
+        riscv64)          FERRON_ARCH="riscv64" ;;
+        s390x)            FERRON_ARCH="s390x" ;;
+        ppc64le)          FERRON_ARCH="powerpc64le" ;;
+        ppc64)            FERRON_ARCH="powerpc64" ;;
+        i686|i586|i486|i386) FERRON_ARCH="i686" ;;
+        *)                FERRON_ARCH="$_uname_arch" ;;
+    esac
+    log_write "detected architecture: $FERRON_ARCH (uname: $_uname_arch)"
+
+    # ------------------------------------------------------------------
+    # 4. C library detection (Linux only)
+    # ------------------------------------------------------------------
+    FERRON_LIBC=""
+    FERRON_OS=$(uname -s 2>/dev/null || echo "unknown")
+    case "$FERRON_OS" in
+        Linux)
+            # Detect glibc version via ldd.
+            _glibc_version=""
+            if command -v ldd >/dev/null 2>&1; then
+                _glibc_version=$(ldd --version 2>&1 | awk '/ldd/{print $NF}' | head -1)
+            fi
+
+            # If glibc >= 2.31, use "gnu"; otherwise musl.
+            if [ -n "$_glibc_version" ]; then
+                if printf '%s\n' "2.31" "$_glibc_version" | sort -V | head -1 | grep -q '^2\.31$'; then
+                    FERRON_LIBC="gnu"
+                else
+                    FERRON_LIBC="musl"
+                fi
+            else
+                # Try to detect musl explicitly.
+                if command -v musl-gcc >/dev/null 2>&1 || \
+                   ldd --version 2>&1 | grep -qi musl; then
+                    FERRON_LIBC="musl"
+                else
+                    # Default to glibc if we can't determine.
+                    FERRON_LIBC="gnu"
+                fi
+            fi
+            log_write "detected libc: $FERRON_LIBC (ldd version: $_glibc_version)"
+            ;;
+        FreeBSD)
+            # FreeBSD binaries are built without a libc suffix in the triple.
+            FERRON_LIBC=""
+            ;;
+        Darwin)
+            # macOS binaries are built without a libc suffix.
+            FERRON_LIBC=""
+            ;;
+    esac
+
+    # ------------------------------------------------------------------
+    # 5. Target triple construction
+    # ------------------------------------------------------------------
+    # The triple format is: ARCH-unknown-OS-LIBC (libc omitted for non-Linux).
+    # Examples:
+    #   x86_64-unknown-linux-gnu
+    #   x86_64-unknown-linux-musl
+    #   aarch64-unknown-freebsd
+    #   aarch64-apple-darwin
+    if [ -n "$FERRON_LIBC" ]; then
+        FERRON_TARGET_TRIPLE="${FERRON_ARCH}-unknown-$(echo $FERRON_OS | tr '[:upper:]' '[:lower:]')-${FERRON_LIBC}"
+    else
+        FERRON_TARGET_TRIPLE="${FERRON_ARCH}-unknown-$(echo $FERRON_OS | tr '[:upper:]' '[:lower:]')"
+    fi
+
+    # For FreeBSD, normalize the OS name in the triple.
+    case "$FERRON_OS" in
+        FreeBSD) FERRON_TARGET_TRIPLE="${FERRON_ARCH}-unknown-freebsd" ;;
+        Darwin)  FERRON_TARGET_TRIPLE="${FERRON_ARCH}-apple-darwin" ;;
+    esac
+
+    log_write "target triple: $FERRON_TARGET_TRIPLE"
+
+    # ------------------------------------------------------------------
+    # 6. Init system detection
+    # ------------------------------------------------------------------
+    # systemd is "active" if /run/systemd/system exists. This is the same
+    # check used by systemd itself to determine whether it is PID 1.
+    if [ -d /run/systemd/system ] 2>/dev/null; then
+        FERRON_HAS_SYSTEMD=1
+        FERRON_HAS_OPENRC=0
+        log_write "active init system: systemd"
+    elif [ -d /run/openrc ] 2>/dev/null; then
+        FERRON_HAS_SYSTEMD=0
+        FERRON_HAS_OPENRC=1
+        log_write "active init system: OpenRC"
+    else
+        FERRON_HAS_SYSTEMD=0
+        FERRON_HAS_OPENRC=0
+        log_write "active init system: SysV (systemd and OpenRC not active)"
+    fi
+
+    # ------------------------------------------------------------------
+    # 7. Existing Ferron installation detection
+    # ------------------------------------------------------------------
+    FERRON_EXISTING_INSTALL=0
+    FERRON_EXISTING_METHOD=""
+
+    # Check if installed via this installer.
+    if [ -f /etc/.ferron-installer.version ]; then
+        FERRON_EXISTING_INSTALL=1
+        FERRON_EXISTING_METHOD="installer"
+        FERRON_PREVIOUS_VERSION=$(cat /etc/.ferron-installer.version 2>/dev/null || echo "unknown")
+        log_write "existing install detected: via installer (version $FERRON_PREVIOUS_VERSION)"
+    fi
+
+    # Check if installed via package manager.
+    if [ "$FERRON_EXISTING_INSTALL" = 0 ]; then
+        if command -v dpkg >/dev/null 2>&1 && dpkg -l ferron3 >/dev/null 2>&1; then
+            FERRON_EXISTING_INSTALL=1
+            FERRON_EXISTING_METHOD="debian"
+            FERRON_PREVIOUS_VERSION=$(dpkg -s ferron3 2>/dev/null | awk '/^Version:/{print $2}')
+            log_write "existing install detected: via Debian package (version $FERRON_PREVIOUS_VERSION)"
+        elif command -v rpm >/dev/null 2>&1 && rpm -q ferron3 >/dev/null 2>&1; then
+            FERRON_EXISTING_INSTALL=1
+            FERRON_EXISTING_METHOD="rhel"
+            FERRON_PREVIOUS_VERSION=$(rpm -q --queryformat '%{VERSION}' ferron3 2>/dev/null)
+            log_write "existing install detected: via RPM package (version $FERRON_PREVIOUS_VERSION)"
+        fi
+    fi
+
+    # Check if the binary exists but wasn't detected via package manager.
+    if [ "$FERRON_EXISTING_INSTALL" = 0 ] && [ -x /usr/sbin/ferron ]; then
+        FERRON_EXISTING_INSTALL=1
+        FERRON_EXISTING_METHOD="binary"
+        FERRON_PREVIOUS_VERSION=$(/usr/sbin/ferron --version 2>/dev/null | head -1 || echo "unknown")
+        log_write "existing binary detected: /usr/sbin/ferron"
+    fi
+
+    # ------------------------------------------------------------------
+    # 8. Install method selection
+    # ------------------------------------------------------------------
+    if [ "$FERRON_EXISTING_INSTALL" = 1 ]; then
+        # Existing install: offer update or uninstall.
+        ui_spinner_pause
+        if [ "$FERRON_EXISTING_METHOD" = "installer" ]; then
+            if ask_choice FERRON_INSTALL_MODE \
+                "Ferron is already installed via the installer. What would you like to do?" \
+                "update" "uninstall"; then
+                log_write "user chose: $FERRON_INSTALL_MODE"
+            fi
+        elif [ "$FERRON_EXISTING_METHOD" = "debian" ] || [ "$FERRON_EXISTING_METHOD" = "rhel" ]; then
+            if ask_choice FERRON_INSTALL_MODE \
+                "Ferron is already installed via the package manager. Manage via package manager?" \
+                "update" "uninstall" "skip"; then
+                log_write "user chose: $FERRON_INSTALL_MODE"
+                # If they chose to manage via package manager, set the method.
+                if [ "${FERRON_INSTALL_MODE:-}" = "update" ] || \
+                   [ "${FERRON_INSTALL_MODE:-}" = "uninstall" ]; then
+                    FERRON_INSTALL_METHOD="$FERRON_EXISTING_METHOD"
+                    log_write "using existing package method: $FERRON_INSTALL_METHOD"
+                fi
+            fi
+        else
+            # Binary install — offer to replace or skip.
+            if ask_choice FERRON_INSTALL_MODE \
+                "A Ferron binary was detected. What would you like to do?" \
+                "update" "skip"; then
+                log_write "user chose: $FERRON_INSTALL_MODE"
+            fi
+        fi
+        ui_spinner_resume
+
+        # If the user chose to skip, we still need a method for the remaining
+        # steps (e.g., service management). Default to the existing method.
+        if [ "${FERRON_INSTALL_MODE:-skip}" = "skip" ]; then
+            FERRON_INSTALL_METHOD="skip"
+            log_write "user chose to skip; FERRON_INSTALL_METHOD=skip"
+            return 0
+        fi
+
+        # If they chose update/uninstall for a package-based install, we can
+        # short-circuit: set the method and skip the rest of preflight.
+        if [ "$FERRON_EXISTING_METHOD" = "debian" ] || \
+           [ "$FERRON_EXISTING_METHOD" = "rhel" ]; then
+            FERRON_INSTALL_METHOD="$FERRON_EXISTING_METHOD"
+            log_write "using existing package method: $FERRON_INSTALL_METHOD"
+            return 0
+        fi
+    fi
+
+    # Fresh install: only ask for method if we haven't already set it.
+    if [ -z "${FERRON_INSTALL_METHOD:-}" ]; then
+        AVAILABLE_METHODS="archive"
+        if [ "$FERRON_DISTRO" = "debian" ] || \
+           [ "$FERRON_DISTRO" = "rhel" ]; then
+            AVAILABLE_METHODS="$AVAILABLE_METHODS $FERRON_DISTRO"
+        fi
+        ui_spinner_pause
+        if ask_choice FERRON_INSTALL_METHOD \
+            "Choose your install method" \
+            $AVAILABLE_METHODS; then
+            log_write "user chose install method: $FERRON_INSTALL_METHOD"
+        fi
+        ui_spinner_resume
+
+        FERRON_INSTALL_MODE="install"
+    else
+        # Existing installer-managed install (update/uninstall chosen).
+        if [ "${FERRON_INSTALL_MODE:-}" = "uninstall" ]; then
+            # For uninstall, set method so archive-specific steps skip.
+            FERRON_INSTALL_METHOD="uninstall"
+            log_write "uninstall mode: skipping rest of preflight"
+            return 0
+        else
+            # Update: default to archive method so the archive-specific steps run.
+            FERRON_INSTALL_METHOD="archive"
+            log_write "update mode: defaulting to archive method for existing $FERRON_EXISTING_METHOD install"
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # 9. Channel selection (for archive downloads)
+    # ------------------------------------------------------------------
+    if [ "$FERRON_INSTALL_METHOD" = "archive" ]; then
+        if [ -z "${FERRON_VERSION:-}" ]; then
+            # These lines would be uncommented, once the LTS channel is available.
+
+            #ui_spinner_pause
+            #if ask_choice FERRON_INSTALL_CHANNEL \
+            #    "Which release channel?" \
+            #    "stable" "lts"; then
+            #    log_write "user chose channel: $FERRON_INSTALL_CHANNEL"
+            #fi
+            #ui_spinner_resume
+
+            #case "${FERRON_INSTALL_CHANNEL:-stable}" in
+            #    lts) FERRON_INSTALL_LTS=1 ;;
+            #    *)   FERRON_INSTALL_LTS=0 ;;
+            #esac
+
+            FERRON_INSTALL_LTS=0
+        else
+            log_write "using user-specified version: $FERRON_VERSION"
+            FERRON_INSTALL_LTS=0
+        fi
+    fi
+
+    # Package manager setup (repo + install) is handled by 15_package_install.sh.
+
+    log_write "preflight complete: method=$FERRON_INSTALL_METHOD"
+}
+
+run_step "Running preflight checks" step_preflight

@@ -1,0 +1,14 @@
+[package]
+name = "ferron-fmt"
+version = "3.0.0-rc.10"
+edition = "2021"
+
+[dependencies]
+ferronconf = { version = "0.5.1", features = ["lexer-public"] }
+clap = { version = "4", features = ["derive"] }
+
+[build-dependencies]
+winresource = "0.1.19"
+
+[lints]
+workspace = true

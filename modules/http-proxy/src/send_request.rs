@@ -1,0 +1,846 @@
+//! Hyper SendRequest wrapper for connection pooling.
+
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use bytes::Bytes;
+use http_body_util::combinators::UnsyncBoxBody;
+use hyper::body::Incoming;
+use hyper::{Request, Response};
+use tokio::io::{AsyncRead, AsyncWrite};
+use zincio_hyper::ZincioIo;
+
+use crate::connections::{PoolKey, PooledConnection};
+use crate::types::error::ProxyError;
+use crate::types::upstream::ResolvedUpstream;
+
+/// Body type used for proxied requests.
+pub struct ProxyBodyInner {
+    inner: UnsyncBoxBody<Bytes, std::io::Error>,
+    recycleable: bool,
+}
+
+#[derive(Clone)]
+pub struct ProxyBody {
+    inner: Arc<parking_lot::Mutex<Option<ProxyBodyInner>>>,
+}
+
+impl ProxyBody {
+    #[inline]
+    pub fn new(body: UnsyncBoxBody<Bytes, std::io::Error>) -> Self {
+        let inner = Arc::new(parking_lot::Mutex::new(Some(ProxyBodyInner {
+            inner: body,
+            recycleable: true,
+        })));
+        Self { inner }
+    }
+
+    #[inline]
+    pub fn recycle(self) -> Option<UnsyncBoxBody<Bytes, std::io::Error>> {
+        let mut guard = self.inner.lock();
+        if !guard.as_ref().is_some_and(|i| i.recycleable) {
+            return None;
+        }
+        Some(guard.take()?.inner)
+    }
+}
+
+impl hyper::body::Body for ProxyBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    #[inline]
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let mut guard = self.inner.lock();
+        if let Some(inner) = guard.as_mut() {
+            let ready_inner =
+                std::task::ready!(std::pin::Pin::new(&mut inner.inner).poll_frame(cx));
+            inner.recycleable = false; // Let's not "recycle" partially-consumed request bodies...
+            Poll::Ready(ready_inner)
+        } else {
+            Poll::Ready(None)
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|i| i.inner.size_hint())
+            .unwrap_or_default()
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(|i| i.inner.is_end_stream())
+    }
+}
+
+enum SendRequestInner {
+    Http1(hyper::client::conn::http1::SendRequest<ProxyBody>),
+    Http2(hyper::client::conn::http2::SendRequest<ProxyBody>),
+}
+
+impl SendRequestInner {
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), hyper::Error>> {
+        match self {
+            SendRequestInner::Http1(s) => s.poll_ready(cx),
+            SendRequestInner::Http2(s) => s.poll_ready(cx),
+        }
+    }
+}
+
+/// A pooled HTTP send request.
+pub struct SendRequestWrapper {
+    inner: Option<SendRequestInner>,
+    last_used: std::time::Instant,
+}
+
+impl SendRequestWrapper {
+    #[inline]
+    pub fn http1(inner: hyper::client::conn::http1::SendRequest<ProxyBody>) -> Self {
+        Self {
+            inner: Some(SendRequestInner::Http1(inner)),
+            last_used: std::time::Instant::now(),
+        }
+    }
+
+    #[inline]
+    pub fn http2(inner: hyper::client::conn::http2::SendRequest<ProxyBody>) -> Self {
+        Self {
+            inner: Some(SendRequestInner::Http2(inner)),
+            last_used: std::time::Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            inner: None,
+            last_used: std::time::Instant::now(),
+        }
+    }
+
+    /// Check if the connection is closed.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        match &self.inner {
+            Some(SendRequestInner::Http1(inner)) => inner.is_closed(),
+            Some(SendRequestInner::Http2(inner)) => inner.is_closed(),
+            None => true,
+        }
+    }
+
+    /// Check readiness of the underlying connection.
+    ///
+    /// Returns `(is_ready, should_keep_in_pool)`:
+    /// - `(true, true)`: ready, caller should use `take_inner()` to extract
+    /// - `(false, true)`: not ready yet, keep in pool (connection is alive)
+    /// - `(_, false)`: dead/stale, discard
+    #[inline]
+    pub fn check_ready(&mut self, timeout: Option<Duration>) -> (bool, bool) {
+        let Some(ref inner) = self.inner else {
+            return (false, false);
+        };
+        let closed = match inner {
+            SendRequestInner::Http1(s) => s.is_closed(),
+            SendRequestInner::Http2(s) => s.is_closed(),
+        };
+        let ready = match inner {
+            SendRequestInner::Http1(s) => s.is_ready(),
+            SendRequestInner::Http2(s) => s.is_ready(),
+        };
+        if closed {
+            return (false, false);
+        }
+        if ready {
+            if timeout.is_some_and(|t| self.last_used.elapsed() > t) {
+                return (false, false);
+            }
+            return (true, true);
+        }
+        // Intentionally do NOT refresh `last_used` here: it marks the last
+        // actual send, and refreshing on every busy poll would defeat idle
+        // expiry (a perpetually-busy connection would look forever fresh).
+        (false, true)
+    }
+
+    /// Wait until the connection becomes ready, closed, or the idle timeout elapses.
+    ///
+    /// Returns `true` if the connection is now ready, `false` if closed/timed out.
+    #[inline]
+    pub async fn wait_ready(&mut self, timeout: Option<Duration>) -> bool {
+        std::future::poll_fn(|cx| match &mut self.inner {
+            Some(i) => match i.poll_ready(cx) {
+                Poll::Ready(Ok(_)) => {
+                    if timeout.is_some_and(|t| self.last_used.elapsed() > t) {
+                        return Poll::Ready(false);
+                    }
+                    Poll::Ready(true)
+                }
+                Poll::Ready(Err(_)) => Poll::Ready(false),
+                Poll::Pending => Poll::Pending,
+            },
+            None => Poll::Ready(false),
+        })
+        .await
+    }
+
+    /// Send an HTTP request and receive the response.
+    #[inline]
+    pub async fn send_request(
+        &mut self,
+        req: Request<ProxyBody>,
+    ) -> Result<Response<Incoming>, ProxyError> {
+        match self.inner.take() {
+            Some(SendRequestInner::Http1(mut inner)) => {
+                let resp = inner.send_request(req).await?;
+                self.inner = Some(SendRequestInner::Http1(inner));
+                self.last_used = std::time::Instant::now();
+                Ok(resp)
+            }
+            Some(SendRequestInner::Http2(mut inner)) => {
+                let resp = inner.send_request(req).await?;
+                self.inner = Some(SendRequestInner::Http2(inner));
+                self.last_used = std::time::Instant::now();
+                Ok(resp)
+            }
+            None => Err(ProxyError::SendRequestError(
+                "send_request wrapper empty".into(),
+            )),
+        }
+    }
+
+    /// Check if the connection is multiplexable (HTTP/2).
+    #[inline]
+    pub fn multiplexable(&self) -> bool {
+        match &self.inner {
+            Some(SendRequestInner::Http1(_)) => false,
+            Some(SendRequestInner::Http2(_)) => true,
+            None => false,
+        }
+    }
+}
+
+/// HTTP/1.x handshake using zincio executor.
+///
+/// `drop_guard` keeps the underlying poll stream alive until the connection
+/// teardown; it is generic so both TCP and Unix streams share this path.
+#[inline]
+pub async fn http1_handshake<I, G>(io: I, drop_guard: G) -> Result<SendRequestWrapper, ProxyError>
+where
+    I: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    G: 'static,
+{
+    let io = ZincioIo::new(io);
+    let (sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    let conn_with_upgrades = conn.with_upgrades();
+    zincio::spawn_detached(async move {
+        let _ = conn_with_upgrades.await;
+        drop(drop_guard);
+    });
+    Ok(SendRequestWrapper::http1(sender))
+}
+
+/// HTTP/2 handshake using zincio executor.
+///
+/// `drop_guard` keeps the underlying poll stream alive until the connection
+/// teardown; it is generic so both TCP and Unix streams share this path.
+#[inline]
+pub async fn http2_handshake<I, G>(io: I, drop_guard: G) -> Result<SendRequestWrapper, ProxyError>
+where
+    I: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    G: 'static,
+{
+    let io = ZincioIo::new(io);
+    let executor = zincio_hyper::ZincioExecutor;
+    let (sender, conn) = hyper::client::conn::http2::handshake(executor, io).await?;
+    zincio::spawn_detached(async move {
+        let _ = conn.await;
+        drop(drop_guard);
+    });
+    Ok(SendRequestWrapper::http2(sender))
+}
+
+/// Information needed to return a connection back to the thread-local pool.
+pub struct PoolReturnInfo {
+    /// The upstream and client IP key.
+    key: Option<PoolKey>,
+    /// The connection wrapper to return.
+    wrapper: Option<SendRequestWrapper>,
+    /// Local limit key, if one was applied.
+    local_limit_key: Option<Arc<ResolvedUpstream>>,
+    /// Whether this is a Unix pool connection.
+    is_unix: bool,
+}
+
+impl PoolReturnInfo {
+    /// Creates a new `PoolReturnInfo` from a pool item and wrapper.
+    ///
+    /// This disarms the item's Drop accounting (via `disarm`) and moves its
+    /// key out, allowing the wrapper to be stored separately and returned
+    /// later without leaking the item's `Rc` pool reference and `Arc`
+    /// upstream key.
+    #[inline]
+    pub fn from_item(
+        mut item: PooledConnection,
+        wrapper: SendRequestWrapper,
+        is_unix: bool,
+    ) -> Self {
+        // Disarm accounting; `item` still drops normally (freeing its `Rc`),
+        // but no longer touches `outstanding` counts (handled on return).
+        let (key, local_limit_key) = item.disarm();
+
+        Self {
+            key,
+            wrapper: Some(wrapper),
+            local_limit_key,
+            is_unix,
+        }
+    }
+
+    /// Whether the pooled connection is already closed.
+    ///
+    /// Closed connections must not be returned to the pool; they are
+    /// discarded instead so the next pull establishes a fresh one.
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.wrapper.as_ref().is_some_and(|w| w.is_closed())
+    }
+
+    /// Discard the pulled slot without returning the connection.
+    ///
+    /// Used when the response body was truncated or abandoned mid-stream:
+    /// an HTTP/1 connection with unread bytes cannot be safely reused, so
+    /// the slot is released (outstanding is decremented, waiters are woken)
+    /// and the connection is dropped instead of parked as idle.
+    #[inline]
+    pub fn discard(mut self) {
+        let _ = self.wrapper.take();
+        if let Some(key) = self.key.take() {
+            crate::connections::discard_connection_to_pool(
+                &key,
+                self.local_limit_key.take(),
+                self.is_unix,
+            );
+        }
+    }
+}
+
+impl Drop for PoolReturnInfo {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(wrapper) = self.wrapper.take() {
+            if let Some(ref key) = self.key {
+                // Return the connection to the thread-local pool.
+                // This is safe because we're on the same thread that pulled it.
+                crate::connections::return_connection_to_pool(
+                    key,
+                    wrapper,
+                    self.local_limit_key.take(),
+                    self.is_unix,
+                );
+            }
+        }
+    }
+}
+
+/// A tracked response body that returns the connection to the pool
+/// after the body is fully consumed, and decrements the connection
+/// tracker for LeastConnections/TwoRandomChoices algorithms.
+pub struct TrackedBody<B> {
+    inner: B,
+    /// Whether the upstream body has been fully drained.
+    ///
+    /// Updated on every `poll_frame` (and initialized at construction for
+    /// already-ended empty bodies). `Drop` is intentionally unbounded
+    /// (`Drop` impls may not add trait bounds), so the drain state is
+    /// cached here instead of querying `is_end_stream` at drop time.
+    drained: bool,
+    _tracker: Option<Arc<()>>,
+    _truncated_tracker: Option<TruncatedTracker>,
+    _pool_return_info: Option<PoolReturnInfo>,
+}
+
+impl<B> TrackedBody<B> {
+    #[inline]
+    pub fn new(
+        inner: B,
+        tracker: Option<Arc<()>>,
+        truncated_tracker: Option<TruncatedTracker>,
+        pool_return_info: Option<PoolReturnInfo>,
+    ) -> Self
+    where
+        B: hyper::body::Body,
+    {
+        let drained = inner.is_end_stream();
+        Self {
+            inner,
+            drained,
+            _tracker: tracker,
+            _truncated_tracker: truncated_tracker,
+            _pool_return_info: pool_return_info,
+        }
+    }
+
+    /// Whether the upstream body was fully drained without truncation.
+    ///
+    /// Only fully-drained bodies leave an HTTP/1 connection reusable: any
+    /// unread remainder would be parsed as the next response. Testable
+    /// without touching pool globals.
+    #[inline]
+    fn response_fully_drained(&self) -> bool {
+        self.drained
+            && !self
+                ._truncated_tracker
+                .as_ref()
+                .is_some_and(TruncatedTracker::is_truncated)
+    }
+}
+
+impl<B> Drop for TrackedBody<B> {
+    #[inline]
+    fn drop(&mut self) {
+        let Some(info) = self._pool_return_info.take() else {
+            return;
+        };
+        // Fully-drained bodies on live connections go back to idle.
+        // Truncated/abandoned bodies (e.g. downstream QUIC stall mid-stream)
+        // poison HTTP/1 reuse: discard the slot instead of parking a
+        // half-read connection as idle for the next pull to block on.
+        if self.response_fully_drained() && !info.is_closed() {
+            drop(info);
+        } else {
+            info.discard();
+        }
+    }
+}
+
+impl<B> hyper::body::Body for TrackedBody<B>
+where
+    B: hyper::body::Body + Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    #[inline]
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        this.drained = this.inner.is_end_stream();
+        result
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Shared state for tracking upstream response body consumption.
+///
+/// Used by `ContentLengthTrackingBody` to record bytes received and
+/// whether the body was truncated, and by `TruncatedTracker` to emit
+/// metrics/logs when the body is dropped.
+pub struct BodyTrackingState {
+    /// Whether the body ended before the expected Content-Length.
+    pub truncated: std::sync::atomic::AtomicBool,
+    /// Total bytes received from the upstream body.
+    pub bytes_received: std::sync::atomic::AtomicU64,
+    /// Expected Content-Length from the upstream response headers.
+    pub expected_length: Option<u64>,
+}
+
+impl BodyTrackingState {
+    #[inline]
+    pub fn new(expected_length: Option<u64>) -> Arc<Self> {
+        Arc::new(Self {
+            truncated: std::sync::atomic::AtomicBool::new(false),
+            bytes_received: std::sync::atomic::AtomicU64::new(0),
+            expected_length,
+        })
+    }
+}
+
+/// A body wrapper that tracks bytes received and detects premature stream termination.
+///
+/// When the upstream response includes a `Content-Length` header, this wrapper counts
+/// the bytes yielded by `poll_frame` and flags truncation if the stream ends before
+/// the expected number of bytes have been received.
+pub struct ContentLengthTrackingBody<B> {
+    inner: B,
+    state: Arc<BodyTrackingState>,
+}
+
+impl<B> ContentLengthTrackingBody<B> {
+    #[inline]
+    pub fn new(inner: B, state: Arc<BodyTrackingState>) -> Self {
+        Self { inner, state }
+    }
+}
+
+impl<B> hyper::body::Body for ContentLengthTrackingBody<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    #[inline]
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let result = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+
+        match &result {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    let len = data.len() as u64;
+                    self.state
+                        .bytes_received
+                        .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            std::task::Poll::Ready(None) => {
+                // Stream ended, check for truncation
+                if let Some(expected) = self.state.expected_length {
+                    let received = self
+                        .state
+                        .bytes_received
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if received < expected {
+                        self.state
+                            .truncated
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        result
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Drop guard that emits a metric and warning log when an upstream response
+/// body was truncated (ended before the declared Content-Length).
+///
+/// This runs when the response body is consumed or dropped, which happens
+/// after the HTTP server framework has finished streaming to the client.
+pub struct TruncatedTracker {
+    state: Arc<BodyTrackingState>,
+    backend_url: String,
+    events: ferron_observability::CompositeEventSink,
+    trace_context: Option<ferron_observability::EventTraceContext>,
+}
+
+impl TruncatedTracker {
+    #[inline]
+    pub fn new(
+        state: Arc<BodyTrackingState>,
+        backend_url: String,
+        events: ferron_observability::CompositeEventSink,
+        trace_context: Option<ferron_observability::EventTraceContext>,
+    ) -> Self {
+        Self {
+            state,
+            backend_url,
+            events,
+            trace_context,
+        }
+    }
+
+    /// Whether the upstream body ended before its declared Content-Length.
+    #[inline]
+    pub(crate) fn is_truncated(&self) -> bool {
+        self.state
+            .truncated
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for TruncatedTracker {
+    #[inline]
+    fn drop(&mut self) {
+        if !self
+            .state
+            .truncated
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+
+        let bytes = self
+            .state
+            .bytes_received
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let expected = self.state.expected_length.unwrap_or(0);
+
+        use ferron_observability::{
+            Event, LogAttributeValue, LogEvent, LogLevel, MetricAttributeValue, MetricEvent,
+            MetricType, MetricValue,
+        };
+
+        self.events.emit(Event::Metric(MetricEvent {
+            name: "ferron.proxy.upstream.response_truncated",
+            attributes: vec![(
+                "ferron.proxy.backend_url",
+                MetricAttributeValue::String(self.backend_url.clone()),
+            )],
+            ty: MetricType::Counter,
+            value: MetricValue::U64(1),
+            unit: Some("{response}"),
+            description: Some("Upstream responses that ended before the declared Content-Length."),
+            trace_context: self.trace_context.clone(),
+        }));
+
+        self.events.emit(Event::Log(LogEvent {
+            level: LogLevel::Warn,
+            message: format!(
+                "Upstream response ended prematurely: received {bytes}/{expected} bytes"
+            ),
+            summary: "Upstream response truncated".into(),
+            target: "ferron-http-proxy",
+            attributes: vec![
+                (
+                    "ferron.proxy.backend_url",
+                    LogAttributeValue::String(self.backend_url.clone()),
+                ),
+                (
+                    "upstream.bytes_received",
+                    LogAttributeValue::I64(bytes as i64),
+                ),
+                (
+                    "upstream.content_length",
+                    LogAttributeValue::I64(expected as i64),
+                ),
+            ],
+            trace_context: self.trace_context.clone(),
+        }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use hyper::body::Frame;
+
+    /// A simple test body that yields pre-configured frames.
+    struct TestBody {
+        frames: Vec<Bytes>,
+        index: usize,
+    }
+
+    impl TestBody {
+        #[inline]
+        fn new(frames: Vec<Bytes>) -> Self {
+            Self { frames, index: 0 }
+        }
+    }
+
+    impl hyper::body::Body for TestBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        #[inline]
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.index < self.frames.len() {
+                let frame = Frame::data(self.frames[self.index].clone());
+                self.index += 1;
+                std::task::Poll::Ready(Some(Ok(frame)))
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        }
+
+        #[inline]
+        fn is_end_stream(&self) -> bool {
+            self.index >= self.frames.len()
+        }
+
+        #[inline]
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            hyper::body::SizeHint::new()
+        }
+    }
+
+    /// Helper: drive a body to completion using poll_frame.
+    #[inline]
+    fn drive_to_completion<B: hyper::body::Body + Unpin>(body: &mut B) {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        loop {
+            let pinned = std::pin::Pin::new(&mut *body);
+            match pinned.poll_frame(&mut cx) {
+                std::task::Poll::Ready(Some(Ok(_))) => {}
+                std::task::Poll::Ready(Some(Err(_))) => break,
+                std::task::Poll::Ready(None) => break,
+                std::task::Poll::Pending => break,
+            }
+        }
+    }
+
+    #[test]
+    fn test_tracking_body_no_content_length() {
+        let state = BodyTrackingState::new(None);
+        let body = TestBody::new(vec![Bytes::from("hello"), Bytes::from(" world")]);
+
+        let mut tracking = ContentLengthTrackingBody::new(body, state.clone());
+        drive_to_completion(&mut tracking);
+
+        assert_eq!(
+            state
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            11
+        );
+        assert!(!state.truncated.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_tracking_body_complete() {
+        let state = BodyTrackingState::new(Some(11));
+        let body = TestBody::new(vec![Bytes::from("hello"), Bytes::from(" world")]);
+
+        let mut tracking = ContentLengthTrackingBody::new(body, state.clone());
+        drive_to_completion(&mut tracking);
+
+        assert_eq!(
+            state
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            11
+        );
+        assert!(!state.truncated.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_tracking_body_truncated() {
+        let state = BodyTrackingState::new(Some(100));
+        let body = TestBody::new(vec![Bytes::from("hello"), Bytes::from(" world")]);
+
+        let mut tracking = ContentLengthTrackingBody::new(body, state.clone());
+        drive_to_completion(&mut tracking);
+
+        assert_eq!(
+            state
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            11
+        );
+        assert!(state.truncated.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_tracking_body_single_frame_exact() {
+        let state = BodyTrackingState::new(Some(5));
+        let body = TestBody::new(vec![Bytes::from("hello")]);
+
+        let mut tracking = ContentLengthTrackingBody::new(body, state.clone());
+        drive_to_completion(&mut tracking);
+
+        assert_eq!(
+            state
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
+        assert!(!state.truncated.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_tracking_body_more_bytes_than_expected() {
+        let state = BodyTrackingState::new(Some(3));
+        let body = TestBody::new(vec![Bytes::from("hello")]);
+
+        let mut tracking = ContentLengthTrackingBody::new(body, state.clone());
+        drive_to_completion(&mut tracking);
+
+        assert_eq!(
+            state
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
+        assert!(!state.truncated.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Helper: wrap a tracking body the way `send_via_wrapper` does, without
+    /// pool globals (no `PoolReturnInfo`, so `Drop` is a no-op here).
+    #[inline]
+    fn drained_tracked_body(
+        expected_length: Option<u64>,
+        frames: Vec<Bytes>,
+    ) -> (
+        TrackedBody<ContentLengthTrackingBody<TestBody>>,
+        Arc<BodyTrackingState>,
+    ) {
+        let state = BodyTrackingState::new(expected_length);
+        let tracking = ContentLengthTrackingBody::new(TestBody::new(frames), state.clone());
+        let tracker = TruncatedTracker::new(
+            state.clone(),
+            "http://backend".to_string(),
+            ferron_observability::CompositeEventSink::with_sampler(vec![], None),
+            None,
+        );
+        let tracked = TrackedBody::new(tracking, None, Some(tracker), None);
+        (tracked, state)
+    }
+
+    #[test]
+    fn test_response_fully_drained_when_complete() {
+        let (mut tracked, _state) =
+            drained_tracked_body(Some(11), vec![Bytes::from("hello"), Bytes::from(" world")]);
+        drive_to_completion(&mut tracked);
+        assert!(tracked.response_fully_drained());
+    }
+
+    #[test]
+    fn test_response_not_drained_when_abandoned() {
+        let (tracked, _state) =
+            drained_tracked_body(Some(11), vec![Bytes::from("hello"), Bytes::from(" world")]);
+        // Never polled: upstream bytes still unread, connection unusable.
+        assert!(!tracked.response_fully_drained());
+    }
+
+    #[test]
+    fn test_response_not_drained_when_truncated() {
+        let (mut tracked, state) = drained_tracked_body(Some(100), vec![Bytes::from("hello")]);
+        drive_to_completion(&mut tracked);
+        assert!(state.truncated.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!tracked.response_fully_drained());
+    }
+}

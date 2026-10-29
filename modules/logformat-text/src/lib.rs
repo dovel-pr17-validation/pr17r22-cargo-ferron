@@ -1,0 +1,591 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use chrono::Local;
+use ferron_core::config::validator::{ConfigurationValidationError, ConfigurationValidator};
+use ferron_core::config::ServerConfigurationValue;
+use ferron_core::loader::ModuleLoader;
+use ferron_core::providers::Provider;
+use ferron_core::{config_validator_scoped_key, validate_directive};
+use ferron_observability::{
+    AccessVisitor, ApplicationLogFormatterContext, LogFormatterContext, LogLevel,
+};
+use once_cell::sync::Lazy;
+
+// Default Enhanced Combined Log Format pattern
+const DEFAULT_ECLF_PATTERN: &str =
+    "%client_ip - %auth_user [%t] \"%method %path_and_query %version\" %status %content_length \"%{Referer}i\" \"%{User-Agent}i\" \"%{Host}i\" \"%trace_id\"";
+
+/// Represents a parsed format token
+#[derive(Debug, Clone, PartialEq)]
+enum FormatToken {
+    /// %field_name - Access log field
+    Field(String),
+    /// %{Header-Name}i - Request header
+    Header(String),
+    /// %{Header-Name}o - Response header
+    ResponseHeader(String),
+    /// %{format}t or %t - Timestamp
+    Timestamp(Option<String>),
+    /// Literal text (including escaped %%)
+    Literal(String),
+}
+
+/// Parsed and compiled format pattern
+#[derive(Debug, Clone)]
+struct FormatPattern {
+    tokens: Vec<FormatToken>,
+}
+
+impl FormatPattern {
+    /// Parse a format pattern string into tokens
+    fn parse(pattern: &str) -> Self {
+        let tokens = Self::tokenize(pattern);
+        Self { tokens }
+    }
+
+    fn tokenize(pattern: &str) -> Vec<FormatToken> {
+        let mut tokens = Vec::new();
+        let mut chars = pattern.chars().peekable();
+        let mut literal_buf = String::new();
+
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                literal_buf.push(c);
+                continue;
+            }
+
+            if !literal_buf.is_empty() {
+                tokens.push(FormatToken::Literal(std::mem::take(&mut literal_buf)));
+            }
+
+            Self::parse_token(&mut chars, &mut tokens, &mut literal_buf);
+        }
+
+        if !literal_buf.is_empty() {
+            tokens.push(FormatToken::Literal(literal_buf));
+        }
+
+        tokens
+    }
+
+    fn parse_token(
+        chars: &mut std::iter::Peekable<std::str::Chars>,
+        tokens: &mut Vec<FormatToken>,
+        literal_buf: &mut String,
+    ) {
+        match chars.peek() {
+            Some(&'%') => {
+                chars.next();
+                literal_buf.push('%');
+            }
+            Some(&'{') => Self::parse_braced_token(chars, tokens, literal_buf),
+            Some(&c) if c.is_alphabetic() || c == '_' => Self::parse_field_token(chars, tokens),
+            _ => literal_buf.push('%'),
+        }
+    }
+
+    fn parse_braced_token(
+        chars: &mut std::iter::Peekable<std::str::Chars>,
+        tokens: &mut Vec<FormatToken>,
+        literal_buf: &mut String,
+    ) {
+        chars.next();
+        let mut inner = String::new();
+        loop {
+            match chars.next() {
+                Some('}') => break,
+                Some(c) => inner.push(c),
+                None => {
+                    literal_buf.push_str("%{");
+                    literal_buf.push_str(&inner);
+                    return;
+                }
+            }
+        }
+
+        match chars.peek() {
+            Some(&'i') => {
+                chars.next();
+                tokens.push(FormatToken::Header(inner));
+            }
+            Some(&'o') => {
+                chars.next();
+                tokens.push(FormatToken::ResponseHeader(inner));
+            }
+            Some(&'t') => {
+                chars.next();
+                tokens.push(FormatToken::Timestamp(Some(inner)));
+            }
+            _ => {
+                literal_buf.push_str("%{");
+                literal_buf.push_str(&inner);
+            }
+        }
+    }
+
+    fn parse_field_token(
+        chars: &mut std::iter::Peekable<std::str::Chars>,
+        tokens: &mut Vec<FormatToken>,
+    ) {
+        let mut field_name = String::new();
+        field_name.push(chars.next().expect("peeked value must be present"));
+        while let Some(&nc) = chars.peek() {
+            if nc.is_alphanumeric() || nc == '_' {
+                field_name.push(nc);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if field_name == "t" {
+            tokens.push(FormatToken::Timestamp(None));
+        } else {
+            tokens.push(FormatToken::Field(field_name));
+        }
+    }
+
+    /// Format the pattern using the provided field values
+    fn format(&self, fields: &HashMap<String, String>, timestamp_format: Option<&str>) -> String {
+        let mut output = String::with_capacity(256);
+
+        for token in &self.tokens {
+            match token {
+                FormatToken::Field(name) => {
+                    let value = fields.get(name.as_str()).map(|s| s.as_str()).unwrap_or("-");
+                    output.push_str(value);
+                }
+                FormatToken::ResponseHeader(name) => {
+                    let key = format!("res_header_{}", name.to_ascii_lowercase().replace("-", "_"));
+                    let value = fields.get(key.as_str()).map(|s| s.as_str()).unwrap_or("-");
+                    output.push_str(value);
+                }
+                FormatToken::Header(name) => {
+                    let key = format!("header_{}", name.to_ascii_lowercase().replace("-", "_"));
+                    let value = fields.get(key.as_str()).map(|s| s.as_str()).unwrap_or("-");
+                    output.push_str(value);
+                }
+                FormatToken::Timestamp(Some(format)) => {
+                    let now = Local::now();
+                    output.push_str(&now.format(format).to_string());
+                }
+                FormatToken::Timestamp(None) => {
+                    // Use configured timestamp_format or CLF default
+                    let fmt = timestamp_format.unwrap_or("%d/%b/%Y:%H:%M:%S %z");
+                    let now = Local::now();
+                    output.push_str(&now.format(fmt).to_string());
+                }
+                FormatToken::Literal(text) => {
+                    output.push_str(text);
+                }
+            }
+        }
+
+        // Strip away control characters for safety (e.g., newlines)
+        output.retain(|c| !c.is_control());
+
+        output
+    }
+}
+
+/// Parse configuration values from the log config block
+fn parse_config(
+    log_config: &ferron_core::config::ServerConfigurationBlock,
+) -> (FormatPattern, Option<String>, Arc<Vec<String>>) {
+    let pattern_str = log_config
+        .directives
+        .get("access_pattern")
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.args.first())
+        .and_then(|arg| arg.as_string_with_interpolations(&std::collections::HashMap::new()))
+        .unwrap_or_else(|| DEFAULT_ECLF_PATTERN.to_string());
+
+    let timestamp_format = log_config
+        .directives
+        .get("timestamp_format")
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.args.first())
+        .and_then(|arg| arg.as_string_with_interpolations(&std::collections::HashMap::new()));
+
+    // Parse enabled fields (optional field filtering like JSON module)
+    let enabled_fields: Arc<Vec<String>> = log_config
+        .directives
+        .get("fields")
+        .map(|entries| {
+            entries
+                .iter()
+                .flat_map(|entry| entry.args.iter())
+                .filter_map(|arg| {
+                    arg.as_string_with_interpolations(&std::collections::HashMap::new())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into();
+
+    let pattern = get_or_compile_pattern(&pattern_str);
+    (pattern, timestamp_format, enabled_fields)
+}
+
+/// Cache for compiled format patterns to avoid re-parsing
+static PATTERN_CACHE: Lazy<parking_lot::Mutex<HashMap<String, FormatPattern>>> =
+    Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+fn get_or_compile_pattern(pattern_str: &str) -> FormatPattern {
+    let mut cache = PATTERN_CACHE.lock();
+    if let Some(pattern) = cache.get(pattern_str) {
+        return pattern.clone();
+    }
+    let pattern = FormatPattern::parse(pattern_str);
+    cache.insert(pattern_str.to_string(), pattern.clone());
+    pattern
+}
+
+/// Text visitor that collects fields into a HashMap
+struct TextVisitor {
+    fields: HashMap<String, String>,
+    enabled_fields: Arc<Vec<String>>,
+}
+
+impl TextVisitor {
+    fn new(enabled_fields: Arc<Vec<String>>) -> Self {
+        Self {
+            fields: HashMap::new(),
+            enabled_fields,
+        }
+    }
+
+    fn is_enabled(&self, name: &str) -> bool {
+        self.enabled_fields.is_empty() || self.enabled_fields.iter().any(|f| f == name)
+    }
+}
+
+impl AccessVisitor for TextVisitor {
+    fn field_string(&mut self, name: &str, value: &str) {
+        if self.is_enabled(name) {
+            self.fields.insert(name.to_string(), value.to_string());
+        }
+    }
+
+    fn field_u64(&mut self, name: &str, value: u64) {
+        if self.is_enabled(name) {
+            self.fields.insert(name.to_string(), value.to_string());
+        }
+    }
+
+    fn field_f64(&mut self, name: &str, value: f64) {
+        if self.is_enabled(name) {
+            self.fields.insert(name.to_string(), value.to_string());
+        }
+    }
+
+    fn field_bool(&mut self, name: &str, value: bool) {
+        if self.is_enabled(name) {
+            self.fields.insert(name.to_string(), value.to_string());
+        }
+    }
+}
+
+struct TextFormatObservabilityProvider;
+
+impl Provider<LogFormatterContext> for TextFormatObservabilityProvider {
+    fn name(&self) -> &str {
+        "text"
+    }
+
+    fn execute(&self, ctx: &mut LogFormatterContext) -> Result<(), Box<dyn std::error::Error>> {
+        let (pattern, timestamp_format, enabled_fields) = parse_config(&ctx.log_config);
+        let mut visitor = TextVisitor::new(enabled_fields);
+        ctx.access_event.visit(&mut visitor);
+
+        let output = pattern.format(&visitor.fields, timestamp_format.as_deref());
+
+        ctx.output = Some(output);
+        Ok(())
+    }
+}
+
+struct TextFormatApplicationObservabilityProvider;
+
+impl Provider<ApplicationLogFormatterContext<'_>> for TextFormatApplicationObservabilityProvider {
+    fn name(&self) -> &str {
+        "text"
+    }
+
+    fn execute(
+        &self,
+        ctx: &mut ApplicationLogFormatterContext<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let trace_id_part = ctx
+            .log_event
+            .trace_context
+            .as_ref()
+            .and_then(|t| str::from_utf8(&t.trace_id).ok())
+            .map(|tid| format!("[trace={}] ", tid))
+            .unwrap_or_default();
+        let line = format!(
+            "[{} {}] {}{}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            match ctx.log_event.level {
+                LogLevel::Error => "ERROR",
+                LogLevel::Warn => "WARN",
+                LogLevel::Info => "INFO",
+                LogLevel::Debug => "DEBUG",
+            },
+            trace_id_part,
+            ctx.log_event.message.trim()
+        );
+        ctx.output = Some(line);
+
+        Ok(())
+    }
+}
+
+pub struct TextFormatObservabilityModuleLoader;
+
+impl ModuleLoader for TextFormatObservabilityModuleLoader {
+    fn register_providers(
+        &mut self,
+        registry: ferron_core::registry::RegistryBuilder,
+    ) -> ferron_core::registry::RegistryBuilder {
+        registry
+            .with_provider::<LogFormatterContext, _>(|| Arc::new(TextFormatObservabilityProvider))
+            .with_provider::<ApplicationLogFormatterContext<'static>, _>(|| {
+                Arc::new(TextFormatApplicationObservabilityProvider)
+            })
+    }
+
+    fn register_directives(&mut self, registry: &mut ferron_core::directives::DirectiveRegistry) {
+        use ferron_core::directives::{Directive, DirectiveSubblock};
+        registry
+            .register(
+                Directive {
+                    name: "fields",
+                    usage: "fields <name>...",
+                    description: "This directive specifies the log field names to include in text output. Empty means all fields.",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            )
+            .register(
+                Directive {
+                    name: "access_pattern",
+                    usage: "access_pattern <pattern>",
+                    description: "This directive specifies the access log format pattern for text output.",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            )
+            .register(
+                Directive {
+                    name: "timestamp_format",
+                    usage: "timestamp_format <format>",
+                    description: "This directive specifies the timestamp format for text log output.",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            );
+    }
+
+    fn register_scoped_configuration_validators(
+        &mut self,
+        registry: &mut HashMap<
+            ferron_core::config::validator::ConfigurationValidatorScopedKey,
+            Box<dyn ferron_core::config::validator::ConfigurationValidator>,
+        >,
+    ) {
+        registry.insert(
+            config_validator_scoped_key!("logformat", "text"),
+            Box::new(TextFormatLogFormatConfigurationValidator),
+        );
+        registry.insert(
+            config_validator_scoped_key!("logformat_application", "text"),
+            Box::new(TextFormatApplicationLogFormatConfigurationValidator),
+        );
+    }
+}
+
+struct TextFormatLogFormatConfigurationValidator;
+
+impl ConfigurationValidator for TextFormatLogFormatConfigurationValidator {
+    fn validate_block(
+        &self,
+        config: &ferron_core::config::ServerConfigurationBlock,
+        validator_ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    ) -> Result<(), ConfigurationValidationError> {
+        validate_directive!(config, validator_ctx.used_directives, fields, optional args(*) => [ServerConfigurationValue::String(_, _) | ServerConfigurationValue::InterpolatedString(_, _)], {});
+        validate_directive!(config, validator_ctx.used_directives, access_pattern, optional args(1) => [ServerConfigurationValue::String(_, _) | ServerConfigurationValue::InterpolatedString(_, _)], {});
+        validate_directive!(config, validator_ctx.used_directives, timestamp_format, optional args(1) => [ServerConfigurationValue::String(_, _) | ServerConfigurationValue::InterpolatedString(_, _)], {});
+
+        Ok(())
+    }
+}
+
+struct TextFormatApplicationLogFormatConfigurationValidator;
+
+impl ConfigurationValidator for TextFormatApplicationLogFormatConfigurationValidator {
+    fn validate_block(
+        &self,
+        _config: &ferron_core::config::ServerConfigurationBlock,
+        _validator_ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    ) -> Result<(), ConfigurationValidationError> {
+        // STUB: currently, there are no additional directives that need to be validated
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_timestamp_token_with_format() {
+        let pattern = FormatPattern::parse("%{%Y-%m-%d}t");
+        assert_eq!(
+            pattern.tokens,
+            vec![FormatToken::Timestamp(Some("%Y-%m-%d".to_string()))]
+        );
+    }
+
+    #[test]
+    fn parses_escaped_percent() {
+        let pattern = FormatPattern::parse("%%test");
+        assert_eq!(
+            pattern.tokens,
+            vec![FormatToken::Literal("%test".to_string())]
+        );
+    }
+
+    #[test]
+    fn parses_mixed_tokens() {
+        let pattern = FormatPattern::parse("%client_ip - %method \"%{User-Agent}i\"");
+        assert_eq!(
+            pattern.tokens,
+            vec![
+                FormatToken::Field("client_ip".to_string()),
+                FormatToken::Literal(" - ".to_string()),
+                FormatToken::Field("method".to_string()),
+                FormatToken::Literal(" \"".to_string()),
+                FormatToken::Header("User-Agent".to_string()),
+                FormatToken::Literal("\"".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_clf_default() {
+        let pattern = FormatPattern::parse(DEFAULT_ECLF_PATTERN);
+        // Should contain fields for client_ip, auth_user, t, method, path_and_query, version,
+        // status, content_length, and headers for Referer and User-Agent
+        let has_client_ip = pattern
+            .tokens
+            .iter()
+            .any(|t| matches!(t, FormatToken::Field(f) if f == "client_ip"));
+        let has_referer = pattern
+            .tokens
+            .iter()
+            .any(|t| matches!(t, FormatToken::Header(h) if h == "Referer"));
+        let has_timestamp = pattern
+            .tokens
+            .iter()
+            .any(|t| matches!(t, FormatToken::Timestamp(None)));
+        assert!(has_client_ip);
+        assert!(has_referer);
+        assert!(has_timestamp);
+    }
+
+    #[test]
+    fn formats_fields_from_map() {
+        let pattern = FormatPattern::parse("%client_ip %method %status");
+        let mut fields = HashMap::new();
+        fields.insert("client_ip".to_string(), "192.168.1.1".to_string());
+        fields.insert("method".to_string(), "GET".to_string());
+        fields.insert("status".to_string(), "200".to_string());
+
+        let output = pattern.format(&fields, None);
+        assert_eq!(output, "192.168.1.1 GET 200");
+    }
+
+    #[test]
+    fn formats_missing_field_as_dash() {
+        let pattern = FormatPattern::parse("%client_ip %missing %status");
+        let mut fields = HashMap::new();
+        fields.insert("client_ip".to_string(), "10.0.0.1".to_string());
+        fields.insert("status".to_string(), "404".to_string());
+
+        let output = pattern.format(&fields, None);
+        assert_eq!(output, "10.0.0.1 - 404");
+    }
+
+    #[test]
+    fn formats_header_from_map() {
+        let pattern = FormatPattern::parse("%{Referer}i");
+        let mut fields = HashMap::new();
+        fields.insert(
+            "header_referer".to_string(),
+            "http://example.com".to_string(),
+        );
+
+        let output = pattern.format(&fields, None);
+        assert_eq!(output, "http://example.com");
+    }
+
+    #[test]
+    fn formats_missing_header_as_dash() {
+        let pattern = FormatPattern::parse("%{Referer}i");
+        let fields = HashMap::new();
+
+        let output = pattern.format(&fields, None);
+        assert_eq!(output, "-");
+    }
+
+    #[test]
+    fn formats_timestamp_with_custom_format() {
+        let pattern = FormatPattern::parse("%{%Y-%m-%d %H:%M:%S}t");
+        let fields = HashMap::new();
+
+        let output = pattern.format(&fields, None);
+        // Should match format like "2026-04-05 12:34:56"
+        assert!(output.len() == 19); // Fixed length for this format
+        assert!(output.contains('-'));
+        assert!(output.contains(':'));
+    }
+
+    #[test]
+    fn visitor_collects_fields() {
+        let mut visitor = TextVisitor::new(Arc::new(Vec::new()));
+        visitor.field_string("method", "POST");
+        visitor.field_u64("status", 201);
+        visitor.field_f64("duration_secs", 0.123);
+        visitor.field_bool("is_secure", true);
+
+        assert_eq!(visitor.fields.get("method").unwrap(), "POST");
+        assert_eq!(visitor.fields.get("status").unwrap(), "201");
+        assert!(visitor
+            .fields
+            .get("duration_secs")
+            .unwrap()
+            .starts_with("0.123"));
+        assert_eq!(visitor.fields.get("is_secure").unwrap(), "true");
+    }
+
+    #[test]
+    fn visitor_respects_enabled_fields() {
+        let enabled = Arc::new(vec!["method".to_string(), "status".to_string()]);
+        let mut visitor = TextVisitor::new(enabled);
+        visitor.field_string("method", "GET");
+        visitor.field_string("path", "/secret");
+        visitor.field_u64("status", 200);
+
+        assert_eq!(visitor.fields.len(), 2);
+        assert!(visitor.fields.contains_key("method"));
+        assert!(visitor.fields.contains_key("status"));
+        assert!(!visitor.fields.contains_key("path"));
+    }
+}

@@ -1,0 +1,94 @@
+.body-main {
+    min-height: 100vh;
+    max-width: 40em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.error-container {
+    width: 100%;
+    text-align: center;
+    padding: 2em 0;
+}
+
+.error-container h1 {
+    margin: 0;
+    letter-spacing: normal;
+}
+
+.error-code {
+    display: block;
+    font-size: 5em;
+    font-weight: 700;
+    line-height: 0.8;
+    letter-spacing: -0.04em;
+}
+
+.error-message {
+    display: block;
+    font-size: 1.4em;
+    font-weight: 600;
+    margin-top: 0.25em;
+}
+
+.error-description {
+    color: var(--muted);
+    font-size: 1.1em;
+    margin: 1em auto 0;
+    max-width: 32em;
+}
+
+.error-trace {
+    margin: 2.5em auto 0;
+    font-size: 0.9em;
+    color: var(--muted);
+}
+
+.error-trace-label {
+    display: inline-block;
+    font-size: 1em;
+    margin-inline-end: 0.75em;
+    vertical-align: middle;
+}
+
+.error-trace-id {
+    display: inline-block;
+    font-family:
+        ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+        "Liberation Mono", monospace;
+    font-size: 0.95em;
+    padding: 0.35em 0.7em;
+    border: 1px solid var(--border);
+    background-color: var(--surface);
+    color: var(--fg);
+    user-select: all;
+    word-break: break-all;
+    vertical-align: middle;
+}
+
+@supports (background-color: color-mix(in srgb, var(--surface) 60%, transparent)) {
+    .error-trace-id {
+        background-color: color-mix(in srgb, var(--surface) 60%, transparent);
+    }
+}
+
+@media screen and (max-width: 512px) {
+    .error-code {
+        font-size: 4em;
+    }
+
+    .error-message {
+        font-size: 1.2em;
+    }
+
+    .error-description {
+        font-size: 1em;
+    }
+
+    .error-trace-label {
+        margin: 0;
+        margin-bottom: 0.25em;
+        display: block;
+    }
+}

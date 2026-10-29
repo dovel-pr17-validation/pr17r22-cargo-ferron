@@ -1,0 +1,983 @@
+mod bad_request;
+mod file_pipeline;
+mod observability;
+#[cfg(any(test, feature = "fuzz"))]
+pub mod pipeline;
+#[cfg(not(any(test, feature = "fuzz")))]
+mod pipeline;
+mod request_utils;
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use ferron_core::config::layer::LayeredConfiguration;
+use ferron_core::pipeline::Pipeline;
+use ferron_http::access_log::{CustomAccessLogField, CustomAccessLogFields};
+use ferron_http::mtls::MtlsCertificates;
+use ferron_http::variables::canonicalize_ip;
+use ferron_http::{
+    trace_context, HttpContext, HttpErrorContext, HttpFileContext, HttpRequest, HttpResponse,
+};
+use ferron_observability::{
+    CompositeEventSink, Event, MetricAttributeValue, MetricEvent, MetricType, MetricValue,
+    TraceAttributeValue, TraceEvent,
+};
+use http::{HeaderValue, Response};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Empty};
+use rustc_hash::FxHashMap;
+
+use crate::config::ThreeStageResolver;
+use crate::util::canonicalize_url::canonicalize_path;
+
+use self::observability::*;
+use self::pipeline::*;
+use self::request_utils::*;
+
+const LOG_TARGET: &str = "ferron-http-server";
+
+/// Methods advertised in the `Allow` header for `OPTIONS *` when
+/// `http { options_allowed_methods }` is not set.
+const DEFAULT_OPTIONS_ALLOWED_METHODS: &str = "GET, HEAD, POST, OPTIONS";
+
+static REQUEST_DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+];
+
+#[cfg(feature = "fuzz")]
+pub type ResponseBody = UnsyncBoxBody<Bytes, io::Error>;
+#[cfg(not(feature = "fuzz"))]
+type ResponseBody = UnsyncBoxBody<Bytes, io::Error>;
+
+pub use bad_request::bad_request_handler;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn request_handler(
+    mut request: HttpRequest,
+    pipeline: &Pipeline<HttpContext>,
+    file_pipeline: &Pipeline<HttpFileContext>,
+    error_pipeline: &Pipeline<HttpErrorContext>,
+    config_resolver: &ThreeStageResolver,
+    local_address: Option<SocketAddr>,
+    remote_address: Option<SocketAddr>,
+    unix_socket_path: Option<PathBuf>,
+    hostname: Option<String>,
+    encrypted: bool,
+    http3_alt_svc: bool,
+    https_port: Option<u16>,
+    events: CompositeEventSink,
+    timeout_duration: Option<std::time::Duration>,
+    peer_identity: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
+    tls_params: Option<&ferron_tls::TlsConnectionParams>,
+    host_control_plane_metadata: Option<Arc<std::collections::BTreeMap<String, String>>>,
+    host_control_plane_span_links: Option<
+        Arc<Vec<ferron_observability::control_plane::SpanLinkConfig>>,
+    >,
+    trace_settings: Arc<crate::config::HttpTraceSettings>,
+) -> Result<Response<ResponseBody>, io::Error> {
+    // Normalize HTTP/2 and HTTP/3 requests
+    if matches!(
+        request.version(),
+        http::Version::HTTP_2 | http::Version::HTTP_3
+    ) {
+        normalize_http2_http3_request(&mut request);
+    }
+
+    let has_events = !events.is_empty();
+    let has_traces = events.has_trace_sinks();
+
+    let scheme: &'static str = if encrypted { "https" } else { "http" };
+    let metric_attrs = has_events.then(|| build_metric_attributes(&request, encrypted, None));
+    let method = has_events.then(|| request.method().clone());
+    let path = has_events.then(|| request.uri().path().to_string());
+    let path_and_query = has_events.then(|| {
+        request
+            .uri()
+            .path_and_query()
+            .map_or_else(|| request.uri().path().to_string(), |pq| pq.to_string())
+    });
+    let version = has_events.then(|| http_version_access_string(request.version()));
+    let server_ip = has_events
+        .then(|| local_address.map(|a| a.ip().to_string()))
+        .flatten();
+    let server_port = has_events
+        .then_some(local_address.map(|a| a.port()))
+        .flatten();
+    let server_ip_canonical = has_events
+        .then(|| local_address.map(|a| canonicalize_ip(a.ip())))
+        .flatten();
+    let initial_client_ip_canonical = has_events
+        .then(|| remote_address.map(|a| canonicalize_ip(a.ip())))
+        .flatten();
+
+    // `trace` and `trace_sampling` are resolved from the global block plus the
+    // matched host block before routing, so per-host settings apply here.
+    let (mut request_trace_context, external_parent) = resolve_request_trace_context(
+        &request,
+        trace_settings.generate,
+        trace_settings.default_sampled(),
+        trace_settings.sampling_probability(),
+        trace_settings.trust_request,
+        has_traces,
+    );
+    let request_span_key =
+        if let Some(request_span_key) = has_traces.then(|| next_span_key("request")) {
+            let method = method
+                .as_ref()
+                .expect("trace events require request metadata to be initialized");
+            let path = path
+                .as_ref()
+                .expect("trace events require request metadata to be initialized");
+            let initial_client_ip_canonical = initial_client_ip_canonical.as_ref();
+
+            let mut builder_attributes = vec![
+                (
+                    Cow::Borrowed("http.request.method"),
+                    TraceAttributeValue::String(method.as_str().to_string()),
+                ),
+                (
+                    Cow::Borrowed("url.path"),
+                    TraceAttributeValue::String(path.clone()),
+                ),
+                (
+                    Cow::Borrowed("url.scheme"),
+                    TraceAttributeValue::StaticStr(scheme),
+                ),
+            ];
+            if let Some(server_ip) = server_ip_canonical.clone().or_else(|| server_ip.clone()) {
+                builder_attributes.push((
+                    Cow::Borrowed("server.address"),
+                    TraceAttributeValue::String(server_ip),
+                ));
+            }
+            if let Some(server_port) = server_port {
+                builder_attributes.push((
+                    Cow::Borrowed("server.port"),
+                    TraceAttributeValue::I64(server_port as i64),
+                ));
+            }
+            if let Some(initial_client_ip_canonical) = initial_client_ip_canonical {
+                builder_attributes.push((
+                    Cow::Borrowed("client.address"),
+                    TraceAttributeValue::String(initial_client_ip_canonical.clone()),
+                ));
+            }
+            if let Some(tls) = tls_params {
+                builder_attributes.push((
+                    Cow::Borrowed("tls.protocol.version"),
+                    TraceAttributeValue::String(tls.protocol_version.clone()),
+                ));
+                builder_attributes.push((
+                    Cow::Borrowed("tls.cipher_suite"),
+                    TraceAttributeValue::String(tls.cipher_suite.clone()),
+                ));
+            }
+            // The requested hostname is known before routing, so it is available to
+            // attribute-based sampling. `server.address` stays the bound socket
+            // address; this attribute names the virtual host the request targets.
+            if let Some(ref host) = hostname {
+                builder_attributes.push((
+                    Cow::Borrowed("ferron.host"),
+                    TraceAttributeValue::String(host.clone()),
+                ));
+            }
+
+            let emitted = events.emit(Event::Trace(TraceEvent::StartSpan {
+                key: Cow::Owned(request_span_key.clone()),
+                name: Cow::Borrowed("ferron.request"),
+                parent: external_parent.clone(),
+                trace_context: request_trace_context.as_ref().map(to_event_trace_context),
+                builder_attributes,
+                attributes: vec![(
+                    "url.full",
+                    TraceAttributeValue::String(request.uri().path_and_query().map_or_else(
+                        || request.uri().path().to_string(),
+                        |path_and_query| path_and_query.to_string(),
+                    )),
+                )],
+                links: convert_control_plane_span_links(&host_control_plane_span_links),
+                control_plane_metadata: host_control_plane_metadata.clone(),
+            }));
+            emitted.then_some(request_span_key)
+        } else {
+            None
+        };
+
+    if request_span_key.is_none() {
+        // Maybe trace is sampled away...
+        if let Some(ctx) = &mut request_trace_context {
+            ctx.sampled = false;
+        }
+    }
+
+    ferron_core::admin::ADMIN_METRICS
+        .requests_total
+        .fetch_add(1, Ordering::Relaxed);
+
+    let active_request_guard = metric_attrs.as_ref().map(|metric_attrs| {
+        ActiveRequestGuard::new(
+            metric_attrs.clone(),
+            request_trace_context.as_ref().map(to_event_trace_context),
+            &events,
+        )
+    });
+
+    let request_timer = std::time::Instant::now();
+
+    // Collect request headers before moving `request` into handler_inner
+    // (only needed for access logging, skip when no access sinks are configured,
+    // even if metrics/traces sinks are present)
+    let request_headers: Vec<(String, String)> = if events.has_access_sinks() {
+        request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.to_string(), v.to_string()))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let (
+        mut response_result,
+        auth_user,
+        final_remote_address,
+        custom_fields,
+        resolved_control_plane_metadata,
+        hide_server,
+        route,
+    ) = request_handler_inner(
+        request,
+        pipeline,
+        file_pipeline,
+        error_pipeline,
+        config_resolver,
+        local_address,
+        remote_address,
+        unix_socket_path,
+        hostname,
+        encrypted,
+        https_port,
+        request_trace_context.clone(),
+        request_span_key.clone(),
+        events.clone(),
+        timeout_duration,
+        peer_identity,
+        host_control_plane_metadata,
+    )
+    .await;
+
+    if let Some(metric_attrs) = metric_attrs {
+        // Compute duration and extract response info only when some sink may consume them.
+        let duration_secs = request_timer.elapsed().as_secs_f64();
+        let timestamp = chrono::Local::now();
+
+        let (status_code, content_length, response_headers) = match &response_result {
+            Ok(r) => {
+                let status = r.status().as_u16();
+                let content_length = r
+                    .headers()
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok());
+                let response_headers = r
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|v| (name.to_string(), v.to_string()))
+                    })
+                    .collect();
+                (status, content_length, response_headers)
+            }
+            Err(_) => (500, None, vec![]),
+        };
+
+        let status_code_attr = (
+            "http.response.status_code",
+            MetricAttributeValue::I64(status_code as i64),
+        );
+        let error_type_attr = (status_code >= 400).then(|| {
+            (
+                "error.type",
+                MetricAttributeValue::String(status_code.to_string()),
+            )
+        });
+
+        let extra_capacity = if error_type_attr.is_some() { 2 } else { 1 };
+        let base_len = metric_attrs.len();
+        let mut request_count_attrs = Vec::with_capacity(base_len + extra_capacity);
+        request_count_attrs.extend(metric_attrs.iter().cloned());
+        request_count_attrs.push(status_code_attr.clone());
+        if let Some(ref attr) = error_type_attr {
+            request_count_attrs.push(attr.clone());
+        }
+
+        let mut duration_attrs = Vec::with_capacity(base_len + extra_capacity);
+        duration_attrs.extend(metric_attrs);
+        duration_attrs.push(status_code_attr.clone());
+        if let Some(ref attr) = error_type_attr {
+            duration_attrs.push(attr.clone());
+        }
+
+        // Decrement active requests (moves metric_attrs, no clone)
+        // It would happen even when the pipeline timed out...
+        drop(active_request_guard);
+
+        events.emit(Event::Metric(MetricEvent {
+            name: "http.server.request.duration",
+            attributes: duration_attrs,
+            ty: MetricType::Histogram(Some(Cow::Borrowed(REQUEST_DURATION_BUCKETS))),
+            value: MetricValue::F64(duration_secs),
+            unit: Some("s"),
+            description: Some("Duration of HTTP server requests."),
+            trace_context: request_trace_context.as_ref().map(to_event_trace_context),
+        }));
+
+        events.emit(Event::Metric(MetricEvent {
+            name: "ferron.http.server.request_count",
+            attributes: request_count_attrs,
+            ty: MetricType::Counter,
+            value: MetricValue::U64(1),
+            unit: Some("{request}"),
+            description: Some("Number of HTTP server requests."),
+            trace_context: request_trace_context.as_ref().map(to_event_trace_context),
+        }));
+
+        // Use the potentially modified remote_address (e.g. from X-Forwarded-For stage)
+        // for access log fields, falling back to the original if not provided.
+        let effective_remote = final_remote_address.or(remote_address);
+        let client_ip = effective_remote.map(|er| er.ip().to_string());
+        let client_port = effective_remote.map(|er| er.port());
+        let client_ip_canonical = effective_remote.map(|er| canonicalize_ip(er.ip()));
+        events.emit(Event::Access(Arc::new(HttpAccessLog {
+            path: path.expect("request metadata should be initialized when events are enabled"),
+            path_and_query: path_and_query
+                .expect("request metadata should be initialized when events are enabled"),
+            method: method
+                .expect("request metadata should be initialized when events are enabled")
+                .as_str()
+                .to_string(),
+            version: Cow::Borrowed(
+                version.expect("request metadata should be initialized when events are enabled"),
+            ),
+            scheme: Cow::Borrowed(scheme),
+            client_ip,
+            client_port,
+            client_ip_canonical,
+            server_ip,
+            server_port,
+            server_ip_canonical,
+            auth_user,
+            status: status_code,
+            content_length,
+            duration_secs,
+            request_headers,
+            response_headers,
+            timestamp,
+            trace_context: request_trace_context.as_ref().map(to_event_trace_context),
+            custom_fields,
+            control_plane_metadata: resolved_control_plane_metadata.clone(),
+        })));
+
+        if let Some(request_span_key) = request_span_key {
+            let error_description = response_result.as_ref().err().map(|e| e.to_string());
+            let mut end_attrs = Vec::with_capacity(3);
+            end_attrs.push((
+                "http.response.status_code",
+                TraceAttributeValue::I64(status_code as i64),
+            ));
+            // The OpenTelemetry `http.route` attribute is the matched route template.
+            // Omit it when no `location` block matched, rather than reporting a
+            // placeholder that reads like a real route.
+            if let Some(ref route) = route {
+                end_attrs.push(("http.route", TraceAttributeValue::String(route.clone())));
+            }
+            if status_code >= 400 {
+                end_attrs.push((
+                    "error.type",
+                    TraceAttributeValue::String(status_code.to_string()),
+                ));
+            }
+            events.emit(Event::Trace(TraceEvent::EndSpan {
+                key: Cow::Owned(request_span_key),
+                name: Cow::Borrowed("ferron.request"),
+                error: error_description,
+                attributes: end_attrs,
+                control_plane_metadata: resolved_control_plane_metadata,
+            }));
+        }
+    }
+
+    if let Ok(response) = &mut response_result {
+        add_http3_alt_svc_header(
+            response.headers_mut(),
+            if http3_alt_svc && encrypted {
+                https_port.or(local_address.map(|la| la.port()))
+            } else {
+                None
+            },
+        );
+        if !hide_server {
+            response
+                .headers_mut()
+                .insert(http::header::SERVER, HeaderValue::from_static("Ferron"));
+        }
+    }
+    response_result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn request_handler_inner(
+    mut request: HttpRequest,
+    pipeline: &Pipeline<HttpContext>,
+    file_pipeline: &Pipeline<HttpFileContext>,
+    error_pipeline: &Pipeline<HttpErrorContext>,
+    config_resolver: &ThreeStageResolver,
+    local_address: Option<SocketAddr>,
+    remote_address: Option<SocketAddr>,
+    unix_socket_path: Option<PathBuf>,
+    hostname: Option<String>,
+    encrypted: bool,
+    https_port: Option<u16>,
+    request_trace_context: Option<trace_context::TraceContext>,
+    request_span_key: Option<String>,
+    events: CompositeEventSink,
+    timeout_duration: Option<std::time::Duration>,
+    peer_identity: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
+    host_control_plane_metadata: Option<Arc<std::collections::BTreeMap<String, String>>>,
+) -> (
+    Result<Response<ResponseBody>, io::Error>,
+    Option<String>,
+    Option<SocketAddr>,
+    Option<FxHashMap<String, CustomAccessLogField>>,
+    Option<Arc<std::collections::BTreeMap<String, String>>>,
+    bool,
+    // The last element is the route template of the matched location blocks.
+    Option<String>,
+) {
+    // Cache global config once to avoid multiple Arc clones on the hot path
+    let global_config = config_resolver.global();
+    // Normalize "Host" header
+    let request_log_trace_context = request_trace_context
+        .as_ref()
+        .map(trace_context::to_event_trace_context);
+    if let Err(e) = normalize_host_header(&mut request, &events) {
+        emit_error_with_trace(
+            &events,
+            format!("Host header normalization error: {}", e),
+            request_log_trace_context.clone(),
+            get_error_log_attributes(
+                "host_header_error",
+                Some(e.to_string()),
+                local_address,
+                remote_address,
+                unix_socket_path,
+            ),
+        );
+        if let Some(response) = execute_error_pipeline(
+            error_pipeline,
+            400,
+            None,
+            LayeredConfiguration::default(),
+            None,
+            &events,
+            request_span_key.as_deref(),
+            host_control_plane_metadata.clone(),
+            Default::default(),
+        )
+        .await
+        {
+            return (Ok(response), None, None, None, None, false, None);
+        }
+        return (
+            Ok(builtin_error_response(
+                400,
+                None,
+                global_config.as_ref().and_then(|g| {
+                    g.get_value("admin_email")
+                        .and_then(|v| v.as_string_with_interpolations(&HashMap::new()))
+                }),
+                request_trace_context
+                    .as_ref()
+                    .map(|tc| tc.trace_id.as_str()),
+            )),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+    }
+
+    // CONNECT requests use authority-form URI (RFC 7231 section 4.3.6).
+    // Skip path-based canonicalization; the forward proxy stage will handle CONNECT.
+    let is_connect = request.method() == http::Method::CONNECT;
+
+    // Deny CONNECT requests with path (CONNECT requests are authority-form only)
+    if is_connect && !request.uri().path().is_empty() {
+        emit_error_with_trace(
+            &events,
+            "CONNECT requests must use authority-form URI",
+            request_log_trace_context.clone(),
+            get_error_log_attributes(
+                "connect_path_error",
+                None,
+                local_address,
+                remote_address,
+                unix_socket_path,
+            ),
+        );
+        return (
+            Ok(builtin_error_response(
+                400,
+                None,
+                global_config.as_ref().and_then(|g| {
+                    g.get_value("admin_email")
+                        .and_then(|v| v.as_string_with_interpolations(&HashMap::new()))
+                }),
+                request_trace_context
+                    .as_ref()
+                    .map(|tc| tc.trace_id.as_str()),
+            )),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+    }
+
+    // Decode location for configuration resolution (routing-only, compute forwarding lazily).
+    // For CONNECT requests, skip canonicalization and set the routing path to "/"
+    // so the config resolver can find the applicable configuration.
+    let url_sanitize_enabled = global_config
+        .as_ref()
+        .and_then(|g| get_http_nested_boolean(g, "url_sanitize"))
+        .unwrap_or(true);
+    let (routing_str, _original_str) = if is_connect {
+        ("/".into(), "".into())
+    } else {
+        // Reject backslashes in URL (unless disabled by configuration)
+        let reject_backslash = global_config
+            .as_ref()
+            .and_then(|g| get_http_nested_boolean(g, "url_reject_backslash"))
+            .unwrap_or(true);
+        if let Err(e) = check_backslash_in_path(request.uri().path(), reject_backslash) {
+            emit_error_with_trace(
+                &events,
+                format!("Invalid request URL: {}", e),
+                request_log_trace_context.clone(),
+                get_error_log_attributes(
+                    "url_backslash_error",
+                    Some(e.to_string()),
+                    local_address,
+                    remote_address,
+                    unix_socket_path,
+                ),
+            );
+            if let Some(response) = execute_error_pipeline(
+                error_pipeline,
+                400,
+                None,
+                LayeredConfiguration::default(),
+                None,
+                &events,
+                request_span_key.as_deref(),
+                host_control_plane_metadata.clone(),
+                Default::default(),
+            )
+            .await
+            {
+                return (Ok(response), None, None, None, None, false, None);
+            }
+            return (
+                Ok(builtin_error_response(
+                    400,
+                    None,
+                    global_config.as_ref().and_then(|g| {
+                        g.get_value("admin_email")
+                            .and_then(|v| v.as_string_with_interpolations(&HashMap::new()))
+                    }),
+                    request_trace_context
+                        .as_ref()
+                        .map(|tc| tc.trace_id.as_str()),
+                )),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+        }
+
+        // Canonicalize + "sanitize" request URL
+        match canonicalize_path(request.uri().path()) {
+            Ok(canonicalized) => {
+                if url_sanitize_enabled && canonicalized.forwarding != request.uri().path() {
+                    let routing = canonicalized.routing.into_owned();
+                    let forwarding = canonicalized.forwarding.into_owned();
+                    let original = match sanitize_request_url(&mut request, &forwarding) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            emit_error_with_trace(
+                                &events,
+                                format!("URL sanitization error: {}", e),
+                                request_log_trace_context.clone(),
+                                get_error_log_attributes(
+                                    "url_sanitize_error",
+                                    Some(e.to_string()),
+                                    local_address,
+                                    remote_address,
+                                    unix_socket_path,
+                                ),
+                            );
+                            if let Some(response) = execute_error_pipeline(
+                                error_pipeline,
+                                400,
+                                None,
+                                LayeredConfiguration::default(),
+                                None,
+                                &events,
+                                request_span_key.as_deref(),
+                                host_control_plane_metadata.clone(),
+                                Default::default(),
+                            )
+                            .await
+                            {
+                                return (Ok(response), None, None, None, None, false, None);
+                            }
+                            return (
+                                Ok(builtin_error_response(
+                                    400,
+                                    None,
+                                    global_config.as_ref().and_then(|g| {
+                                        g.get_value("admin_email").and_then(|v| {
+                                            v.as_string_with_interpolations(&HashMap::new())
+                                        })
+                                    }),
+                                    request_trace_context
+                                        .as_ref()
+                                        .map(|tc| tc.trace_id.as_str()),
+                                )),
+                                None,
+                                None,
+                                None,
+                                None,
+                                false,
+                                None,
+                            );
+                        }
+                    };
+                    (routing, original)
+                } else {
+                    (canonicalized.routing.into_owned(), canonicalized.original)
+                }
+            }
+            Err(e) => {
+                emit_error_with_trace(
+                    &events,
+                    format!("Invalid request URL pathname: {}", e),
+                    request_log_trace_context.clone(),
+                    get_error_log_attributes(
+                        "url_path_error",
+                        Some(e.to_string()),
+                        local_address,
+                        remote_address,
+                        unix_socket_path,
+                    ),
+                );
+                if let Some(response) = execute_error_pipeline(
+                    error_pipeline,
+                    400,
+                    None,
+                    LayeredConfiguration::default(),
+                    None,
+                    &events,
+                    request_span_key.as_deref(),
+                    host_control_plane_metadata.clone(),
+                    Default::default(),
+                )
+                .await
+                {
+                    return (Ok(response), None, None, None, None, false, None);
+                }
+                return (
+                    Ok(builtin_error_response(
+                        400,
+                        None,
+                        global_config.as_ref().and_then(|g| {
+                            g.get_value("admin_email")
+                                .and_then(|v| v.as_string_with_interpolations(&HashMap::new()))
+                        }),
+                        request_trace_context
+                            .as_ref()
+                            .map(|tc| tc.trace_id.as_str()),
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                );
+            }
+        }
+    };
+
+    // Create a partial HttpContext for variable resolution during config resolution.
+    // This allows all interpolation variables (request.*, server.*, remote.*) to be
+    // resolved dynamically from the context rather than pre-populated in a HashMap.
+    let mut ctx = HttpContext::default();
+    ctx.events = events.clone();
+    ctx.configuration = LayeredConfiguration::default();
+    ctx.hostname = hostname.clone();
+    ctx.routing_uri = routing_str.parse().ok();
+    ctx.encrypted = encrypted;
+    ctx.local_address = local_address;
+    ctx.remote_address = remote_address;
+    ctx.https_port = https_port;
+    ctx.req = Some(request);
+
+    // Attach parsed or generated trace context to the HttpContext extensions so stages/modules can access it.
+    if let Some(ref tc) = request_trace_context {
+        ctx.insert::<trace_context::TraceContextKey>(tc.clone());
+    }
+
+    // Attach mTLS certificates so stages/modules can access them.
+    if let Some(peer_identity) = peer_identity {
+        ctx.insert::<MtlsCertificates>(MtlsCertificates(peer_identity));
+    }
+
+    // When starting the top-level request span later, prefer external_parent if available
+    let resolution = config_resolver.resolve(
+        local_address.map(|la| la.ip()),
+        hostname.as_deref().unwrap_or(""),
+        &routing_str,
+        &ctx,
+    );
+
+    let Some(resolution) = resolution else {
+        if let Some(response) = execute_error_pipeline(
+            error_pipeline,
+            404,
+            None,
+            LayeredConfiguration::default(),
+            None,
+            &events,
+            request_span_key.as_deref(),
+            host_control_plane_metadata.clone(),
+            ctx.variables.clone(),
+        )
+        .await
+        {
+            return (Ok(response), None, None, None, None, ctx.hide_server, None);
+        }
+        return (
+            Ok(builtin_error_response(
+                404,
+                None,
+                global_config.as_ref().and_then(|g| {
+                    g.get_value("admin_email")
+                        .and_then(|v| v.as_string_with_interpolations(&ctx))
+                }),
+                request_trace_context
+                    .as_ref()
+                    .map(|tc| tc.trace_id.as_str()),
+            )),
+            None,
+            None,
+            None,
+            None,
+            ctx.hide_server,
+            None,
+        );
+    };
+
+    // Fill in the resolved configuration
+    ctx.configuration = resolution.configuration.clone();
+    ctx.hostname = (!resolution.location_path.hostname_segments.is_empty())
+        .then_some(resolution.location_path.hostname_segments.join("."));
+
+    // Route template for observability, built from the configured `location` block
+    // names, so it stays low-cardinality (for example `/api/users/:id`).
+    let route = route_template(&resolution.location_path.path_segments);
+
+    // Extract resolved control plane metadata for post-resolution events
+    let resolved_control_plane_metadata =
+        ferron_observability::control_plane::ControlPlaneConfig::from_layered(&ctx.configuration)
+            .map(|cp| cp.metadata);
+
+    // Handle OPTIONS * requests (asterisk-form request target)
+    // Early response before pipeline execution
+    if is_options_star_request(ctx.req.as_ref().expect("invalid HTTP context state")) {
+        // `options_allowed_methods` lives inside the `http` block, so it needs the
+        // nested lookup; a flat lookup would always miss it and silently fall back
+        // to the default list.
+        // The value can be interpolated from request data, so it is not
+        // guaranteed to be usable as a header even though `ferron validate`
+        // rejects an unusable configured value. Fall back to the default list
+        // instead of failing the response.
+        let allow_header = resolution
+            .configuration
+            .get_nested_value("http", "options_allowed_methods", false)
+            .and_then(|v| v.as_string_with_interpolations(&ctx))
+            .filter(|value| http::HeaderValue::from_str(value).is_ok())
+            .unwrap_or_else(|| DEFAULT_OPTIONS_ALLOWED_METHODS.to_owned());
+
+        let response = Response::builder()
+            .status(200)
+            .header("Allow", &allow_header)
+            .header("Content-Length", "0")
+            .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync())
+            .expect("failed to build OPTIONS * response");
+
+        return (Ok(response), None, None, None, None, ctx.hide_server, route);
+    }
+
+    let request = ctx.req.take().expect("invalid HTTP context state");
+    let request_uri = request.uri().clone();
+    let (request_parts, body) = request.into_parts();
+    let cloned_request = resolution.has_error_config.then(|| {
+        http::Request::from_parts(
+            request_parts.clone(),
+            Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync(),
+        )
+    });
+    let request = http::Request::from_parts(request_parts, body);
+
+    let admin_email = resolution
+        .configuration
+        .get_value("admin_email", false)
+        .and_then(|v| v.as_string_with_interpolations(&ctx));
+    let resolution_configuration2 = resolution.configuration.clone();
+    ctx.req = Some(request);
+    ctx.original_uri = Some(request_uri);
+
+    execute_pipeline_stages(
+        &mut ctx,
+        pipeline,
+        file_pipeline,
+        &events,
+        "",
+        &resolution.location_path.path_segments,
+        request_span_key.as_deref(),
+        timeout_duration,
+        resolved_control_plane_metadata.clone(),
+    )
+    .await;
+
+    if let HttpResponse::BuiltinError(status, _) = ctx
+        .res
+        .as_ref()
+        .unwrap_or(&HttpResponse::BuiltinError(404, None))
+    {
+        let status = *status;
+        if status >= 400 {
+            ctx.previous_error = Some(status);
+            if ctx.req.is_none() {
+                ctx.req = cloned_request;
+            }
+            // Rebuild the resolver request from the current request in context
+            if let Some(req) = ctx.req.take() {
+                // Preserve the request for error resolution
+                ctx.req = Some(req);
+                let error_resolution = config_resolver.resolve_error_scoped(
+                    local_address.map(|la| la.ip()),
+                    hostname.as_deref().unwrap_or(""),
+                    &routing_str,
+                    status,
+                    &ctx,
+                );
+
+                if let Some(error_resolution) = error_resolution {
+                    let execute_error_config = if let (Some(config1), Some(config2)) = (
+                        error_resolution.configuration.layers.last(),
+                        resolution_configuration2.layers.last(),
+                    ) {
+                        !Arc::ptr_eq(config1, config2)
+                    } else {
+                        false
+                    };
+                    if execute_error_config {
+                        ctx.configuration = error_resolution.configuration;
+                        ctx.res = None;
+
+                        execute_pipeline_stages(
+                            &mut ctx,
+                            pipeline,
+                            file_pipeline,
+                            &events,
+                            "Error ",
+                            &resolution.location_path.path_segments,
+                            request_span_key.as_deref(),
+                            timeout_duration,
+                            resolved_control_plane_metadata.clone(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    let auth_user = ctx.auth_user.clone();
+    let final_remote = ctx.remote_address;
+    let custom_fields = ctx.extensions.remove::<CustomAccessLogFields>();
+    let trace_context = ctx
+        .extensions
+        .get::<trace_context::TraceContextKey>()
+        .cloned();
+    let fallback_trace_id = trace_context.as_ref().map(|tc| tc.trace_id.clone());
+    (
+        match ctx.res.unwrap_or(HttpResponse::BuiltinError(404, None)) {
+            HttpResponse::Custom(response) => Ok(response),
+            HttpResponse::BuiltinError(status, headers) => {
+                if let Some(response) = execute_error_pipeline(
+                    error_pipeline,
+                    status,
+                    headers.clone(),
+                    ctx.configuration.clone(),
+                    trace_context,
+                    &events,
+                    request_span_key.as_deref(),
+                    resolved_control_plane_metadata.clone(),
+                    ctx.variables,
+                )
+                .await
+                {
+                    Ok(response)
+                } else {
+                    Ok(builtin_error_response(
+                        status,
+                        headers.as_ref(),
+                        admin_email,
+                        fallback_trace_id.as_deref(),
+                    ))
+                }
+            }
+            HttpResponse::Abort => Err(io::Error::other("Aborted")),
+        },
+        auth_user,
+        final_remote,
+        custom_fields,
+        resolved_control_plane_metadata,
+        ctx.hide_server,
+        route,
+    )
+}

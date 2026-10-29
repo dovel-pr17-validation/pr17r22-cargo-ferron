@@ -1,0 +1,310 @@
+//! Configuration parsing and evaluation for the `map` directive.
+//!
+//! Parses `map <source> <destination> { ... }` entries from layered
+//! configuration into typed `MapRule` structures and evaluates them
+//! at request time to set destination variables.
+
+use ferron_core::config::layer::LayeredConfiguration;
+use ferron_core::config::{ServerConfigurationBlock, ServerConfigurationDirectiveEntry, Variables};
+use regex::{Regex, RegexBuilder};
+
+/// A compiled mapping rule from configuration.
+#[derive(Debug, Clone)]
+pub struct MapRule {
+    /// The source string.
+    pub source: SourceString,
+    /// The destination variable name (e.g., `category`).
+    pub destination: String,
+    /// Ordered mapping entries: evaluated in priority order at runtime.
+    pub entries: Vec<MapEntry>,
+    /// Fallback value when no entry matches.
+    pub default: Option<String>,
+}
+
+/// A single mapping entry within a `map` block.
+#[derive(Debug, Clone)]
+pub enum MapEntry {
+    /// Exact string match (no wildcards).
+    Exact { key: String, value: String },
+    /// Wildcard match: the pattern contains `*` converted to regex.
+    Wildcard { regex: Regex, value: String },
+    /// Regex match: compiled at parse time.
+    Regex { regex: Regex, value: String },
+}
+
+/// A source string
+#[derive(Debug, Clone)]
+pub enum SourceString {
+    // A variable name (e.g., `request.uri.path`)
+    VariableName(String),
+    // An interpolated string (e.g., `"{{request.method}} {{request.uri.path}}"`)
+    Interpolated(ferron_core::config::ServerConfigurationValue),
+}
+
+impl SourceString {
+    /// Obtains the source string from a configuration value
+    #[inline]
+    pub fn from_value(value: ferron_core::config::ServerConfigurationValue) -> Option<Self> {
+        match value {
+            s @ ferron_core::config::ServerConfigurationValue::InterpolatedString(_, _) => {
+                Some(Self::Interpolated(s))
+            }
+            ferron_core::config::ServerConfigurationValue::String(s, _) => {
+                Some(Self::VariableName(s))
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolves the source string
+    #[inline]
+    pub fn resolve(&self, variables: &impl Variables) -> String {
+        match self {
+            Self::VariableName(name) => variables.resolve(name).unwrap_or_default(),
+            Self::Interpolated(value) => value
+                .as_string_with_interpolations(variables)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Parse all `map` directives from the layered configuration and evaluate them
+/// against the given context, populating destination variables.
+///
+/// Returns `true` if at least one map was evaluated, `false` otherwise.
+pub fn evaluate_map_directives(
+    config: &LayeredConfiguration,
+    variables: &impl Variables,
+) -> Vec<(String, String)> {
+    let rules = parse_map_config(config, variables);
+    if rules.is_empty() {
+        return Vec::new();
+    }
+
+    let mut results = Vec::new();
+
+    for rule in rules {
+        let source_value: String = rule.source.resolve(variables);
+
+        let result_value = evaluate_entries(&source_value, &rule.entries, &rule.default);
+        results.push((rule.destination, result_value));
+    }
+
+    results
+}
+
+/// Evaluate mapping entries against a source value, returning the matched result.
+///
+/// Priority order: exact match -> wildcard match -> regex match -> default.
+fn evaluate_entries(source: &str, entries: &[MapEntry], default: &Option<String>) -> String {
+    for entry in entries {
+        if let MapEntry::Exact { key, value } = entry {
+            if source == key {
+                return value.clone();
+            }
+        }
+    }
+
+    let mut best_wildcard: Option<&str> = None;
+    let mut best_wildcard_len = 0usize;
+    for entry in entries {
+        if let MapEntry::Wildcard { regex, .. } = entry {
+            if regex.is_match(source) {
+                let pattern_str = regex.as_str();
+                // Approximate: use regex pattern length as proxy for specificity
+                if pattern_str.len() > best_wildcard_len {
+                    best_wildcard_len = pattern_str.len();
+                    if let MapEntry::Wildcard { value, .. } = entry {
+                        best_wildcard = Some(value);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(value) = best_wildcard {
+        return value.to_string();
+    }
+
+    for entry in entries {
+        if let MapEntry::Regex { regex, value } = entry {
+            if let Some(captures) = regex.captures(source) {
+                let resolved = resolve_captures(value, &captures);
+                return resolved;
+            }
+        }
+    }
+
+    default.clone().unwrap_or_default()
+}
+
+/// Resolve capture group references ($1, $2, etc.) in the result value.
+fn resolve_captures(value: &str, captures: &regex::Captures) -> String {
+    let mut result = String::new();
+    let mut chars = value.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            let mut num_str = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    num_str.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if let Ok(idx) = num_str.parse::<usize>() {
+                if let Some(m) = captures.get(idx) {
+                    result.push_str(m.as_str());
+                } else {
+                    // Capture group doesn't exist, keep reference literally
+                    result.push('$');
+                    result.push_str(&num_str);
+                }
+            } else {
+                result.push('$');
+                result.push_str(&num_str);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Parse all `map` directives from the layered configuration.
+fn parse_map_config(config: &LayeredConfiguration, ctx: &impl Variables) -> Vec<MapRule> {
+    let mut rules = Vec::new();
+    let entries = config.get_entries("map", true);
+
+    for entry in entries {
+        if let Some(rule) = parse_map_entry(entry, ctx) {
+            rules.push(rule);
+        }
+    }
+
+    rules
+}
+
+/// Parse a single `map` directive entry into a `MapRule`.
+fn parse_map_entry(
+    entry: &ServerConfigurationDirectiveEntry,
+    ctx: &impl Variables,
+) -> Option<MapRule> {
+    if entry.args.len() != 2 {
+        return None;
+    }
+
+    let source = SourceString::from_value(entry.args[0].clone())?;
+    let destination = entry.args[1].as_str()?.to_string();
+
+    let block = entry.children.as_ref()?;
+    let (entries, default) = parse_map_block(block, ctx);
+
+    Some(MapRule {
+        source,
+        destination,
+        entries,
+        default,
+    })
+}
+
+/// Parse the contents of a `map { ... }` block.
+fn parse_map_block(
+    block: &ServerConfigurationBlock,
+    ctx: &impl Variables,
+) -> (Vec<MapEntry>, Option<String>) {
+    let mut entries = Vec::new();
+    let mut default = None;
+
+    if let Some(default_entries) = block.directives.get("default") {
+        if let Some(entry) = default_entries.first() {
+            if let Some(value) = entry
+                .args
+                .first()
+                .and_then(|v| v.as_string_with_interpolations(ctx))
+            {
+                default = Some(value);
+            }
+        }
+    }
+
+    if let Some(exact_entries) = block.directives.get("exact") {
+        for entry in exact_entries {
+            if entry.args.len() == 2 {
+                if let (Some(key), Some(value)) = (entry.args[0].as_str(), entry.args[1].as_str()) {
+                    if key.contains('*') {
+                        // Treat as wildcard
+                        if let Some(wildcard_regex) = wildcard_to_regex(key) {
+                            if let Ok(regex) = Regex::new(&wildcard_regex) {
+                                entries.push(MapEntry::Wildcard {
+                                    regex,
+                                    value: value.to_string(),
+                                });
+                            }
+                        }
+                    } else {
+                        entries.push(MapEntry::Exact {
+                            key: key.to_string(),
+                            value: value.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(regex_entries) = block.directives.get("regex") {
+        for entry in regex_entries {
+            if entry.args.len() >= 2 {
+                if let (Some(pattern), Some(value)) =
+                    (entry.args[0].as_str(), entry.args[1].as_str())
+                {
+                    let case_insensitive = if let Some(ref children) = entry.children {
+                        children.get_flag("case_insensitive")
+                    } else {
+                        false
+                    };
+
+                    let regex_result = RegexBuilder::new(pattern)
+                        .case_insensitive(case_insensitive)
+                        .build();
+
+                    if let Ok(regex) = regex_result {
+                        entries.push(MapEntry::Regex {
+                            regex,
+                            value: value.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    (entries, default)
+}
+
+/// Convert a wildcard pattern (with `*`) to a regex string.
+///
+/// `*` is treated as "match any characters" (equivalent to `.*` in regex).
+fn wildcard_to_regex(pattern: &str) -> Option<String> {
+    if !pattern.contains('*') {
+        return None;
+    }
+
+    let mut result = String::new();
+    for c in pattern.chars() {
+        match c {
+            '*' => result.push_str(".*"),
+            '\\' | '.' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
+                result.push('\\');
+                result.push(c);
+            }
+            _ => result.push(c),
+        }
+    }
+
+    // Anchor to full match
+    Some(format!("^{}$", result))
+}

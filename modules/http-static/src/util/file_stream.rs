@@ -1,0 +1,189 @@
+//! Async file streaming utilities.
+//!
+//! Provides `FileStream` which wraps a `zincio::fs::File` and implements
+//! `futures_core::Stream` for position-based async reads without spawning blocking threads.
+
+use std::io;
+
+use bytes::Bytes;
+use ferron_http::file_descriptor::ReusedFile;
+use futures_core::Stream;
+use send_wrapper::SendWrapper;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio_util::sync::ReusableBoxFuture;
+
+const MAX_BUFFER_SIZE: usize = 65536;
+
+type ReadChunkResult = Option<Result<Bytes, io::Error>>;
+type ReadChunkFuture = ReusableBoxFuture<'static, ReadChunkResult>;
+
+/// A wrapper over `zincio::fs::File` that implements `futures_core::Stream`.
+///
+/// Uses `read_at` for position-based async reads without spawning blocking threads.
+/// `SendWrapper` ensures the non-`Send` `zincio::fs::File` can safely cross thread boundaries
+/// as long as it's only polled on the same thread (guaranteed by the single-threaded runtime).
+pub struct FileStream {
+    file: SendWrapper<std::rc::Rc<std::cell::UnsafeCell<ReusedFile>>>,
+    current_pos: u64,
+    remaining: Option<u64>,
+    finished: bool,
+    started: bool,
+    read_future: Option<ReadChunkFuture>,
+}
+
+impl FileStream {
+    /// Create a new `FileStream` reading from `start` to `end` (exclusive).
+    /// If `end` is `None`, reads until EOF.
+    #[inline]
+    pub fn new(file: ReusedFile, start: u64, end: Option<u64>) -> Self {
+        let remaining = remaining_from_bounds(start, end);
+        let finished = matches!(remaining, Some(0));
+
+        Self {
+            started: false,
+            file: SendWrapper::new(std::rc::Rc::new(std::cell::UnsafeCell::new(file))),
+            current_pos: start,
+            remaining,
+            finished,
+            read_future: None,
+        }
+    }
+
+    /// Clones the stream from `start` to `end`, preserving the remaining bytes and read future.
+    #[inline]
+    pub fn clone_stream(&self, start: u64, end: Option<u64>) -> Self {
+        let remaining = remaining_from_bounds(start, end);
+        let finished = matches!(remaining, Some(0));
+
+        Self {
+            started: self.started,
+            file: self.file.clone(),
+            current_pos: start,
+            remaining,
+            finished,
+            read_future: None,
+        }
+    }
+}
+
+impl Stream for FileStream {
+    type Item = Result<Bytes, io::Error>;
+
+    #[inline]
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+
+        if !self.started {
+            self.started = true;
+            // SAFETY: FileStream uses read_at (which uses pread), which does not require rewinding.
+            //         Also, other call is reading the separate struct field...
+            unsafe { (&mut *self.file.get()).dont_rewind() };
+        }
+
+        if self.read_future.is_none() {
+            self.read_future = Some(ReusableBoxFuture::new(SendWrapper::new(read_chunk(
+                self.file.clone(),
+                self.current_pos,
+                self.remaining,
+            ))));
+        }
+
+        let poll_result = self
+            .read_future
+            .as_mut()
+            .expect("file stream read future is not initialized")
+            .poll(cx);
+
+        match poll_result {
+            Poll::Ready(Some(Ok(chunk))) => {
+                let chunk_len = chunk.len() as u64;
+                self.current_pos = self.current_pos.saturating_add(chunk_len);
+                if let Some(remaining) = &mut self.remaining {
+                    *remaining = remaining.saturating_sub(chunk_len);
+                    self.finished = *remaining == 0;
+                }
+
+                if self.finished {
+                    self.read_future = None;
+                } else {
+                    let file = self.file.clone();
+                    let current_pos = self.current_pos;
+                    let remaining = self.remaining;
+                    self.read_future
+                        .as_mut()
+                        .expect("file stream read future is not initialized")
+                        .set(SendWrapper::new(read_chunk(file, current_pos, remaining)));
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(option) => {
+                if option.is_none() {
+                    self.finished = true;
+                }
+                self.read_future = None;
+                Poll::Ready(option)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.finished {
+            return (0, Some(0));
+        }
+        (
+            self.remaining.map_or(0, |r| {
+                // Divide and add 1 if reminder > 0
+                r.saturating_div(MAX_BUFFER_SIZE as u64)
+                    + u64::from(r % MAX_BUFFER_SIZE as u64 != 0)
+            }) as usize,
+            None,
+        )
+    }
+}
+
+#[inline]
+fn remaining_from_bounds(start: u64, end: Option<u64>) -> Option<u64> {
+    end.map(|end| end.saturating_sub(start))
+}
+
+#[inline]
+fn buffer_size_for_read(remaining: Option<u64>) -> usize {
+    remaining.map_or(MAX_BUFFER_SIZE, |remaining| {
+        remaining.min(MAX_BUFFER_SIZE as u64) as usize
+    })
+}
+
+/// Reads a single chunk from a zincio file at the given position.
+async fn read_chunk(
+    file: SendWrapper<std::rc::Rc<std::cell::UnsafeCell<ReusedFile>>>,
+    pos: u64,
+    remaining: Option<u64>,
+) -> ReadChunkResult {
+    let buffer_sz = buffer_size_for_read(remaining);
+    if buffer_sz == 0 {
+        return None;
+    }
+    let buffer_uninit = Box::new_uninit_slice(buffer_sz);
+    // Safety: The buffer is a boxed slice of uninitialized `u8` values. `u8` is a primitive type.
+    let buffer: Box<[u8]> = unsafe { buffer_uninit.assume_init() };
+    // SAFETY: other call is modifying the separate struct field...
+    let file = unsafe { &*file.get() };
+    let result = file.read_at(buffer, pos).await;
+    match result {
+        (Ok(n), buffer) => {
+            if n == 0 {
+                None
+            } else {
+                let mut bytes = Bytes::from_owner(buffer);
+                bytes.truncate(n);
+                Some(Ok(bytes))
+            }
+        }
+        (Err(e), _) => Some(Err(e)),
+    }
+}

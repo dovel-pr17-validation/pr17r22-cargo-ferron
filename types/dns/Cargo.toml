@@ -1,0 +1,12 @@
+[package]
+name = "ferron-dns"
+version = "3.0.0-rc.10"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+ferron-core = { path = "../../core" }
+hickory-resolver = "0.26"
+
+[lints]
+workspace = true

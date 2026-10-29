@@ -1,0 +1,1054 @@
+mod cli;
+#[cfg(unix)]
+mod daemon;
+mod panic;
+mod service;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use clap::Parser;
+use ferron_core::config::adapter::ConfigurationAdapter;
+use ferron_core::config::layer::LayeredConfiguration;
+use ferron_core::config::validator::{
+    ConfigurationValidatorContext, ConfigurationValidatorDiagnostic,
+    ConfigurationValidatorDiagnosticKind,
+};
+use ferron_core::config::ServerConfigurationSpan;
+use ferron_core::loader::ModuleLoader;
+use ferron_core::logging::LogLevel;
+use ferron_core::registry::{Registry, RegistryBuilder};
+use ferron_core::runtime::{Runtime, RuntimeSettings};
+use ferron_core::shutdown::{ReloadState, RELOAD_STATE, RELOAD_TOKEN, SHUTDOWN_TOKEN};
+use ferron_core::{log_debug, log_info, log_warn};
+use serde::Serialize;
+use tokio_util::sync::CancellationToken;
+
+#[cfg(windows)]
+use mimalloc::MiMalloc;
+#[cfg(unix)]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(windows)]
+use crate::cli::WinServiceCommands;
+use crate::cli::{parse_config_params, Cli, Commands};
+use crate::panic::install_panic_hook;
+
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+shadow_rs::shadow!(build);
+
+/// Returns a vector of default module loaders to be used by the application.
+/// This includes loaders for core functionality, HTTP server features, configuration adapters,
+/// TLS, observability, and DNS.
+#[cfg(feature = "profile-default")]
+pub fn default_profile() -> Vec<Box<dyn ModuleLoader>> {
+    vec![
+        Box::new(ferron_core::builtin::BuiltinModuleLoader),
+        Box::new(ferron_http_server::BasicHttpModuleLoader::default()),
+        Box::new(ferron_http_ratelimit::HttpRateLimitModuleLoader),
+        Box::new(ferron_http_abuseban::HttpAbuseProtectionModuleLoader),
+        Box::new(ferron_http_response::HttpResponseModuleLoader),
+        Box::new(ferron_http_rewrite::HttpRewriteModuleLoader),
+        Box::new(ferron_http_map::HttpMapModuleLoader),
+        Box::new(ferron_http_variables::HttpVariablesModuleLoader),
+        Box::new(ferron_http_canary::HttpCanaryModuleLoader::default()),
+        Box::new(ferron_http_cache::HttpCacheModuleLoader::default()),
+        Box::new(ferron_http_buffer::HttpBufferModuleLoader),
+        Box::new(ferron_http_compression::HttpCompressionModuleLoader),
+        Box::new(ferron_http_replace::HttpReplaceModuleLoader),
+        Box::new(ferron_http_fauth::ForwardedAuthenticationModuleLoader::default()),
+        Box::new(ferron_http_cgi::CgiModuleLoader),
+        Box::new(ferron_http_scgi::ScgiModuleLoader),
+        Box::new(ferron_http_fcgi::FcgiModuleLoader::default()),
+        Box::new(ferron_http_static::StaticFileModuleLoader),
+        Box::new(ferron_http_jsonerror::HttpJsonErrorModuleLoader),
+        Box::new(ferron_http_headers::HttpHeadersModuleLoader),
+        Box::new(ferron_http_proxy::ReverseProxyModuleLoader::default()),
+        Box::new(ferron_http_fproxy::ForwardProxyModuleLoader),
+        Box::new(ferron_http_basicauth::HttpBasicAuthModuleLoader),
+        Box::new(ferron_http_traceid::HttpTraceIdModuleLoader),
+        Box::new(ferron_admin_api::AdminApiModuleLoader::default()),
+        Box::new(ferron_config_json::JsonConfigurationAdapterModuleLoader),
+        Box::new(ferron_config_ferronconf::FerronConfConfigurationAdapterModuleLoader),
+        Box::new(ferron_ocsp_stapler::OcspStaplerModuleLoader),
+        Box::new(ferron_tls_manual::TlsManualModuleLoader),
+        Box::new(ferron_tls_acme::TlsAcmeModuleLoader),
+        Box::new(ferron_tls_local::LocalTlsModuleLoader),
+        Box::new(ferron_tls_http::TlsHttpModuleLoader::default()),
+        Box::new(ferron_observability_consolelog::ConsoleObservabilityModuleLoader::default()),
+        Box::new(ferron_observability_logfile::LogFileObservabilityModuleLoader::default()),
+        Box::new(ferron_observability_otlp::OtlpObservabilityModuleLoader::default()),
+        Box::new(ferron_observability_prometheus::PrometheusObservabilityModuleLoader::default()),
+        Box::new(ferron_observability_statsd::StatsdObservabilityModuleLoader::default()),
+        Box::new(ferron_logformat_json::JsonFormatObservabilityModuleLoader),
+        Box::new(ferron_logformat_text::TextFormatObservabilityModuleLoader),
+        Box::new(ferron_metrics_process::ProcessMetricsModuleLoader::default()),
+        Box::new(ferron_metrics_admin::AdminMetricsModuleLoader::default()),
+        Box::new(ferron_metrics_reload::ReloadMetricsModuleLoader::default()),
+        Box::new(ferron_dns_stalwartlite::StalwartDnsModuleLoader),
+        Box::new(ferron_dns_command::CommandDnsModuleLoader),
+    ]
+}
+
+/// Initializes the application (before loading the web server) by installing the panic hook.
+pub fn init() {
+    install_panic_hook();
+}
+
+/// Entrypoint for the application. Initializes logging and runs the main logic,
+/// handling any errors that occur.
+pub fn main(loaders: Vec<Box<dyn ModuleLoader>>) {
+    if let Err(e) = main_inner(loaders) {
+        if !ferron_core::logging::is_init() {
+            let _ = ferron_core::logging::init_stdio_logger(LogLevel::Error);
+        }
+        if ferron_core::logging::is_init() {
+            ferron_core::log_error!("{}", e);
+        } else {
+            eprintln!("Error: {}", e);
+        }
+        std::process::exit(1);
+    } else {
+        std::process::exit(0);
+    }
+}
+
+fn main_inner(loaders: Vec<Box<dyn ModuleLoader>>) -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Run {
+            config_path,
+            config_params,
+            config_adapter,
+            verbose,
+            #[cfg(windows)]
+            service,
+        } => {
+            #[cfg(not(windows))]
+            let service = false;
+            run(
+                config_path,
+                config_params,
+                config_adapter,
+                verbose,
+                service,
+                loaders,
+            )?;
+        }
+        #[cfg(unix)]
+        Commands::Daemon {
+            config_path,
+            config_params,
+            config_adapter,
+            verbose,
+            pid_file,
+        } => {
+            run_daemon(
+                config_path,
+                config_params,
+                config_adapter,
+                verbose,
+                pid_file,
+                loaders,
+            )?;
+        }
+        Commands::Validate {
+            config_path,
+            config_params,
+            config_adapter,
+            json,
+        } => {
+            if !json && !ferron_core::logging::is_init() {
+                let _ = ferron_core::logging::init_stdio_logger(LogLevel::Info);
+            }
+            validate(
+                config_path,
+                config_params,
+                config_adapter,
+                loaders,
+                json,
+                false,
+                true, // Print "all good" when configuration is valid with no diagnostics
+            )?;
+        }
+        Commands::Doctor {
+            config_path,
+            config_params,
+            config_adapter,
+            json,
+        } => {
+            if !json && !ferron_core::logging::is_init() {
+                let _ = ferron_core::logging::init_stdio_logger(LogLevel::Info);
+            }
+            validate(
+                config_path,
+                config_params,
+                config_adapter,
+                loaders,
+                json,
+                true, // Don't filter best practice violations
+                true, // Print "all good" when configuration is valid with no diagnostics
+            )?;
+        }
+        Commands::Adapt {
+            config_path,
+            config_params,
+            config_adapter,
+        } => {
+            adapt(config_path, config_params, config_adapter, loaders)?;
+        }
+        #[cfg(windows)]
+        Commands::WinService { subcommand } => {
+            winservice(subcommand)?;
+        }
+        Commands::Version => {
+            print_version();
+        }
+        Commands::Directives => {
+            print_directives(loaders)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_daemon(
+    config_path: Option<String>,
+    config_params: Option<String>,
+    config_adapter: Option<String>,
+    verbose: bool,
+    pid_file: Option<String>,
+    loaders: Vec<Box<dyn ModuleLoader>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ferron_core::log_info;
+    use ferron_core::logging::LogLevel;
+
+    // Initialize stdio logger for validation phase (before daemonizing)
+    let log_level = if verbose {
+        LogLevel::Debug
+    } else {
+        LogLevel::Info
+    };
+
+    if !ferron_core::logging::is_init() {
+        ferron_core::logging::init_stdio_logger(log_level)?;
+    }
+
+    // First, validate the configuration before daemonizing
+    log_info!("Validating configuration before daemonizing...");
+    let loaders = validate(
+        config_path.clone(),
+        config_params.clone(),
+        config_adapter.clone(),
+        loaders,
+        false,
+        false,
+        false,
+    )?;
+    log_info!("Configuration validation successful");
+
+    // Check if an existing daemon is already running (if PID file is specified)
+    if let Some(ref pid_path) = pid_file {
+        if daemon::check_pid_file(pid_path)? {
+            return Err(
+                format!("Daemon is already running (PID file exists: {})", pid_path).into(),
+            );
+        }
+    }
+
+    // Daemonize the process
+    log_info!("Daemonizing process...");
+    let is_daemon = daemon::daemonize()?;
+
+    if !is_daemon {
+        // This is the parent process, exit gracefully
+        log_info!("Parent process exiting, daemon started in background");
+        return Ok(());
+    }
+
+    // This is the daemon process
+
+    // Write PID file if specified
+    if let Some(ref pid_path) = pid_file {
+        daemon::write_pid_file(pid_path)?;
+
+        let pid_path = pid_path.clone();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() else {
+                return;
+            };
+            rt.block_on(async {
+                let shutdown_token = SHUTDOWN_TOKEN.load();
+                shutdown_token.cancelled().await;
+                let _ = daemon::remove_pid_file(&pid_path);
+            });
+        });
+    }
+
+    daemon::setup_signal_handlers()?;
+    log_info!("Signal handlers installed (SIGINT, SIGTERM -> shutdown, SIGHUP -> reload)");
+
+    // Now run the server with the same configuration
+    log_info!("Starting web server as daemon...");
+    run(
+        config_path,
+        config_params,
+        config_adapter,
+        verbose,
+        false,
+        loaders,
+    )?;
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn winservice(subcommand: WinServiceCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match subcommand {
+        WinServiceCommands::Install {
+            config_path,
+            config_params,
+            config_adapter,
+            verbose,
+        } => {
+            let mut args = Vec::new();
+
+            if let Some(path) = config_path {
+                args.push("--config".to_string());
+                args.push(path);
+            }
+
+            if let Some(params) = config_params {
+                args.push("--config-params".to_string());
+                args.push(params);
+            }
+
+            if let Some(adapter) = config_adapter {
+                args.push("--config-adapter".to_string());
+                args.push(adapter);
+            }
+
+            if verbose {
+                args.push("--verbose".to_string());
+            }
+
+            service::install_service(args)?;
+        }
+        WinServiceCommands::Uninstall => {
+            service::uninstall_service()?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Helper struct to hold configuration loading results
+struct ConfigLoadResult {
+    loaders: Vec<Box<dyn ModuleLoader>>,
+    config_adapter: Box<dyn ConfigurationAdapter>,
+    config_adapter_params: HashMap<String, String>,
+}
+
+/// Load configuration adapters from loaders and resolve the appropriate adapter
+fn load_config_adapters(
+    config_path: Option<String>,
+    config_params: Option<String>,
+    config_adapter_name: Option<String>,
+    mut loaders: Vec<Box<dyn ModuleLoader>>,
+) -> Result<ConfigLoadResult, Box<dyn std::error::Error>> {
+    let mut config_registry: HashMap<&'static str, Box<dyn ConfigurationAdapter>> = HashMap::new();
+    for loader in &mut loaders {
+        loader.register_configuration_adapters(&mut config_registry);
+    }
+
+    let mut adapter_name = config_adapter_name;
+    let mut adapter_params = config_params
+        .map(|s| parse_config_params(&s))
+        .unwrap_or_default();
+
+    let path = config_path.unwrap_or("./ferron.conf".to_string());
+
+    // Determine configuration adapter based on file extension if not specified
+    if adapter_name.is_none() {
+        if let Some(ext) = std::path::Path::new(&path)
+            .extension()
+            .and_then(|s| s.to_str())
+        {
+            for (name, adapter) in &config_registry {
+                if adapter.file_extension().iter().any(|e| e == &ext) {
+                    adapter_name = Some(name.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    if adapter_params.is_empty() {
+        adapter_params.insert("file".to_string(), path);
+    }
+
+    let adapter_name = adapter_name.ok_or(anyhow::anyhow!(
+        "Configuration adapter not specified and could not be determined from file extension"
+    ))?;
+
+    let config_adapter = config_registry
+        .remove(adapter_name.as_str())
+        .ok_or(anyhow::anyhow!("Configuration adapter not found"))?;
+
+    Ok(ConfigLoadResult {
+        loaders,
+        config_adapter,
+        config_adapter_params: adapter_params,
+    })
+}
+
+#[derive(Serialize)]
+pub struct ConfigurationValidationResult {
+    valid: bool,
+    diagnostics: Vec<ferron_core::config::validator::ConfigurationValidatorDiagnostic>,
+}
+
+/// Run global and per-protocol configuration validators
+fn run_configuration_validators(
+    loaders: &mut [Box<dyn ModuleLoader>],
+    config: &ferron_core::config::ServerConfiguration,
+    global_validator_registry: &[Box<dyn ferron_core::config::validator::ConfigurationValidator>],
+    per_protocol_validator_registry: &HashMap<
+        &'static str,
+        Vec<Box<dyn ferron_core::config::validator::ConfigurationValidator>>,
+    >,
+    scoped_validator_registry: Arc<
+        HashMap<
+            ferron_core::config::validator::ConfigurationValidatorScopedKey,
+            Box<dyn ferron_core::config::validator::ConfigurationValidator>,
+        >,
+    >,
+) -> ConfigurationValidationResult {
+    if config.ports.is_empty()
+        && config.global_config.directives.is_empty()
+        && config.global_config.matchers.is_empty()
+    {
+        // Configuration is empty overall!
+        // Ah, the Zeta autocomplete gave me this... *sweaty smile*
+        return ConfigurationValidationResult {
+            valid: false,
+            diagnostics: vec![ConfigurationValidatorDiagnostic {
+                kind: ConfigurationValidatorDiagnosticKind::InvalidConfiguration,
+                message: "Empty configuration provided".to_string(),
+                span: None,
+                scope: None,
+            }],
+        };
+    }
+
+    let mut all_diagnostics = Vec::new();
+
+    let mut validator_ctx = ConfigurationValidatorContext {
+        used_directives: HashSet::new(),
+        is_global: true,
+        scoped_validators: scoped_validator_registry.clone(),
+        diagnostics: Vec::new(),
+        scope: None,
+    };
+    for validator in global_validator_registry {
+        validator_ctx.is_global = true; // Reset validator ctx
+        validator_ctx.scoped_validators = scoped_validator_registry.clone();
+        validator_ctx.scope = None;
+        let validator_result = validator.validate_block(&config.global_config, &mut validator_ctx);
+        if let Err(err) = validator_result {
+            let diagnostic = validator_ctx.create_diagnostic(
+                ConfigurationValidatorDiagnosticKind::InvalidConfiguration,
+                err.to_string(),
+                err.span.or(config.global_config.span.clone()),
+            );
+            all_diagnostics.extend(validator_ctx.diagnostics);
+            all_diagnostics.push(diagnostic);
+            return ConfigurationValidationResult {
+                valid: false,
+                diagnostics: all_diagnostics,
+            };
+        }
+    }
+    let unused_global_directives: Vec<(String, Option<ServerConfigurationSpan>)> = config
+        .global_config
+        .directives
+        .iter()
+        .filter(|d| !validator_ctx.used_directives.contains(d.0))
+        .flat_map(|d| d.1.iter().map(|s| (d.0.clone(), s.span.clone())))
+        .collect();
+    for (directive, span) in unused_global_directives {
+        validator_ctx
+            .diagnostics
+            .push(validator_ctx.create_diagnostic(
+                ConfigurationValidatorDiagnosticKind::UnknownDirective,
+                format!("`{directive}` is unused in the block"),
+                span.or(config.global_config.span.clone()),
+            ));
+    }
+    all_diagnostics.append(&mut validator_ctx.diagnostics);
+
+    let mut config_blocks_registry = HashMap::new();
+    for loader in loaders {
+        loader.register_per_protocol_configuration_blocks(config, &mut config_blocks_registry);
+    }
+    for (protocol, blocks) in &config_blocks_registry {
+        if let Some(validators) = per_protocol_validator_registry.get(protocol) {
+            for block in blocks {
+                validator_ctx.used_directives.clear();
+                validator_ctx.diagnostics.clear();
+                for validator in validators {
+                    validator_ctx.is_global = false; // Reset validator ctx
+                    validator_ctx.scoped_validators = scoped_validator_registry.clone();
+                    validator_ctx.scope = Some(format!("{protocol} {}", block.0));
+                    let validator_result = validator.validate_block(block.1, &mut validator_ctx);
+                    if let Err(err) = validator_result {
+                        let diagnostic = validator_ctx.create_diagnostic(
+                            ConfigurationValidatorDiagnosticKind::InvalidConfiguration,
+                            err.to_string(),
+                            err.span.or(block.1.span.clone()),
+                        );
+                        all_diagnostics.extend(validator_ctx.diagnostics);
+                        all_diagnostics.push(diagnostic);
+                        return ConfigurationValidationResult {
+                            valid: false,
+                            diagnostics: all_diagnostics,
+                        };
+                    }
+                }
+                let unused_directives: Vec<(String, Option<ServerConfigurationSpan>)> = block
+                    .1
+                    .directives
+                    .iter()
+                    .filter(|d| !validator_ctx.used_directives.contains(d.0))
+                    .flat_map(|d| d.1.iter().map(|s| (d.0.clone(), s.span.clone())))
+                    .collect();
+                for (directive, span) in unused_directives {
+                    validator_ctx
+                        .diagnostics
+                        .push(validator_ctx.create_diagnostic(
+                            ConfigurationValidatorDiagnosticKind::UnknownDirective,
+                            format!("`{directive}` is unused in the block"),
+                            span.or(block.1.span.clone()),
+                        ));
+                }
+                all_diagnostics.append(&mut validator_ctx.diagnostics);
+            }
+        }
+    }
+
+    ConfigurationValidationResult {
+        valid: true,
+        diagnostics: all_diagnostics,
+    }
+}
+
+fn print_validation_result(
+    validation_result: ConfigurationValidationResult,
+    print_all_good: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let all_good = validation_result.diagnostics.is_empty() && validation_result.valid;
+
+    for diagnostic in validation_result.diagnostics {
+        // Log warnings for configuration diagnostics (e.g., unknown directives)
+        log_warn!("{diagnostic}");
+    }
+
+    if !validation_result.valid {
+        Err(anyhow::anyhow!(
+            "The configuration validation failed. Check the configuration diagnostics above."
+        ))?;
+    }
+
+    if all_good && print_all_good {
+        log_info!("All good! Configuration check passed with no issues.");
+    }
+
+    Ok(())
+}
+
+pub(crate) fn run(
+    config_path: Option<String>,
+    config_params: Option<String>,
+    config_adapter: Option<String>,
+    verbose: bool,
+    service: bool,
+    mut loaders: Vec<Box<dyn ModuleLoader>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let log_level = if verbose {
+        LogLevel::Debug
+    } else {
+        LogLevel::Info
+    };
+
+    #[cfg(windows)]
+    {
+        // Check if running as a Windows service
+        if service {
+            // Initialize service logger (Event Log)
+            ferron_core::logging::init_service_logger(service::SERVICE_NAME, log_level)?;
+            ferron_core::log_info!(
+                "Starting {} in Windows service mode",
+                env!("CARGO_PKG_NAME")
+            );
+
+            // Run as Windows service (config is passed via service arguments)
+            return service::run_service(
+                config_path,
+                config_params,
+                config_adapter,
+                verbose,
+                loaders,
+            )
+            .map_err(|e| e.into());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = service; // silence unused variable warning
+
+    if !ferron_core::logging::is_init() {
+        ferron_core::logging::init_stdio_logger(log_level)?;
+    }
+
+    #[cfg(unix)]
+    let _ = daemon::setup_signal_handlers();
+
+    let mut config_registry = HashMap::new();
+    let mut registry_builder = RegistryBuilder::new();
+    let mut global_validator_registry = Vec::new();
+    let mut per_protocol_validator_registry = HashMap::new();
+    let mut scoped_validator_registry = HashMap::new();
+    for loader in &mut loaders {
+        loader.register_per_protocol_configuration_validators(&mut per_protocol_validator_registry);
+        loader.register_global_configuration_validators(&mut global_validator_registry);
+        loader.register_scoped_configuration_validators(&mut scoped_validator_registry);
+        loader.register_configuration_adapters(&mut config_registry);
+        registry_builder = loader.register_stages(registry_builder);
+        registry_builder = loader.register_providers(registry_builder);
+    }
+    let registry = registry_builder.build();
+
+    let mut config_adapter_name = config_adapter.as_deref();
+    let mut config_adapter_params = config_params
+        .map(|s| parse_config_params(&s))
+        .unwrap_or_default();
+
+    let path = config_path.unwrap_or("./ferron.conf".to_string());
+
+    // Determine configuration adapter based on file extension if not specified
+    if config_adapter_name.is_none() {
+        if let Some(ext) = std::path::Path::new(&path)
+            .extension()
+            .and_then(|s| s.to_str())
+        {
+            for (name, adapter) in &config_registry {
+                if adapter.file_extension().iter().any(|e| e == &ext) {
+                    config_adapter_name = Some(name);
+                    break;
+                }
+            }
+        }
+    }
+
+    if config_adapter_params.is_empty() {
+        config_adapter_params.insert("file".to_string(), path);
+    }
+
+    let config_adapter_name = config_adapter_name.ok_or(anyhow::anyhow!(
+        "Configuration adapter not specified and could not be determined from file extension"
+    ))?;
+
+    let config_adapter = config_registry
+        .get(config_adapter_name)
+        .ok_or(anyhow::anyhow!("Configuration adapter not found"))?;
+
+    load_modules(
+        loaders,
+        registry,
+        config_adapter.as_ref(),
+        config_adapter_params,
+        global_validator_registry,
+        per_protocol_validator_registry,
+        #[allow(clippy::arc_with_non_send_sync)]
+        Arc::new(scoped_validator_registry),
+    )?;
+
+    Ok(())
+}
+
+fn validate(
+    config_path: Option<String>,
+    config_params: Option<String>,
+    config_adapter: Option<String>,
+    loaders: Vec<Box<dyn ModuleLoader>>,
+    json: bool,
+    doctor: bool,
+    print_all_good: bool,
+) -> Result<Vec<Box<dyn ModuleLoader>>, Box<dyn std::error::Error>> {
+    let ConfigLoadResult {
+        mut loaders,
+        config_adapter,
+        config_adapter_params,
+    } = load_config_adapters(config_path, config_params, config_adapter, loaders)?;
+
+    let mut global_validator_registry = Vec::new();
+    let mut per_protocol_validator_registry = HashMap::new();
+    let mut scoped_validator_registry = HashMap::new();
+    for loader in &mut loaders {
+        loader.register_per_protocol_configuration_validators(&mut per_protocol_validator_registry);
+        loader.register_global_configuration_validators(&mut global_validator_registry);
+        loader.register_scoped_configuration_validators(&mut scoped_validator_registry);
+    }
+
+    let (config, _, _) = {
+        let result = config_adapter.adapt(&config_adapter_params);
+        if !json {
+            result.map_err(|e| anyhow::anyhow!("Failed to load configuration: {e}"))?
+        } else {
+            let resultv = match result {
+                Ok(resultv) => resultv,
+                Err(e) => {
+                    let validation_result = ConfigurationValidationResult {
+                        valid: false,
+                        diagnostics: vec![ConfigurationValidatorDiagnostic {
+                            kind: ConfigurationValidatorDiagnosticKind::InvalidConfiguration,
+                            message: e.to_string(),
+                            span: e.span,
+                            scope: None,
+                        }],
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&validation_result).map_err(
+                            |e| anyhow::anyhow!(
+                                "Failed to prepare JSON configuration validation result {e}"
+                            )
+                        )?
+                    );
+                    std::process::exit(1);
+                }
+            };
+            resultv
+        }
+    };
+
+    let mut validation_result = run_configuration_validators(
+        &mut loaders,
+        &config,
+        &global_validator_registry,
+        &per_protocol_validator_registry,
+        #[allow(clippy::arc_with_non_send_sync)]
+        Arc::new(scoped_validator_registry),
+    );
+
+    if !doctor {
+        // Remove best practice violations from diagnostics, since this is not `ferron doctor`...
+        validation_result.diagnostics.retain(|d| {
+            !matches!(
+                d.kind,
+                ConfigurationValidatorDiagnosticKind::BestPracticeViolation
+            )
+        });
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&validation_result).map_err(|e| anyhow::anyhow!(
+                "Failed to prepare JSON configuration validation result {e}"
+            ))?
+        );
+        if !validation_result.valid {
+            std::process::exit(1);
+        }
+    } else {
+        print_validation_result(validation_result, print_all_good)?;
+    }
+
+    Ok(loaders)
+}
+
+fn adapt(
+    config_path: Option<String>,
+    config_params: Option<String>,
+    config_adapter: Option<String>,
+    loaders: Vec<Box<dyn ModuleLoader>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ConfigLoadResult {
+        config_adapter,
+        config_adapter_params,
+        ..
+    } = load_config_adapters(config_path, config_params, config_adapter, loaders)?;
+
+    let (config, _, _) = config_adapter
+        .adapt(&config_adapter_params)
+        .map_err(|e| anyhow::anyhow!("Failed to load configuration: {e}"))?;
+    let json = serde_json::to_string_pretty(&config)?;
+    println!("{}", json);
+
+    Ok(())
+}
+
+fn load_modules(
+    mut loaders: Vec<Box<dyn ModuleLoader>>,
+    registry: Arc<Registry>,
+    config_adapter: &dyn ConfigurationAdapter,
+    config_adapter_params: HashMap<String, String>,
+    global_validator_registry: Vec<Box<dyn ferron_core::config::validator::ConfigurationValidator>>,
+    per_protocol_validator_registry: HashMap<
+        &'static str,
+        Vec<Box<dyn ferron_core::config::validator::ConfigurationValidator>>,
+    >,
+    scoped_validator_registry: Arc<
+        HashMap<
+            ferron_core::config::validator::ConfigurationValidatorScopedKey,
+            Box<dyn ferron_core::config::validator::ConfigurationValidator>,
+        >,
+    >,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut runtime = None;
+    let watcher = std::rc::Rc::new(std::cell::RefCell::new(None));
+    ferron_core::registry::GLOBAL_REGISTRY
+        .set(registry.clone())
+        .ok();
+
+    // Read drift_hints setting from config adapter params (default: true)
+    let drift_hints_enabled = config_adapter_params
+        .get("drift_hints")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+    ferron_core::admin::ADMIN_METRICS
+        .config_drift_hints_enabled
+        .store(drift_hints_enabled, std::sync::atomic::Ordering::Relaxed);
+
+    loop {
+        let reload_state: Arc<(CancellationToken, ReloadState)> = Default::default();
+        RELOAD_STATE.swap(reload_state.clone()).0.cancel();
+
+        let (runtime, mut watcher_obtained) = match load_modules_config(
+            config_adapter,
+            config_adapter_params.clone(),
+            &mut loaders,
+            &global_validator_registry,
+            &per_protocol_validator_registry,
+            scoped_validator_registry.clone(),
+            registry.clone(),
+        ) {
+            Ok((config, watcher, modules, metadata)) => {
+                let first_time = runtime.is_none();
+
+                let mut layered_config = LayeredConfiguration::new();
+                layered_config.add_layer(config.global_config.clone());
+                let io_uring_enabled = layered_config
+                    .get_entry("runtime", false)
+                    .and_then(|d| d.children.as_ref().map(|c| c.get_flag("io_uring")))
+                    .unwrap_or(false);
+                let cpu_affinity = layered_config
+                    .get_entry("runtime", false)
+                    .and_then(|d| {
+                        d.children
+                            .as_ref()
+                            .and_then(|c| c.directives.get("cpu_affinity"))
+                    })
+                    .and_then(|e| e.last())
+                    .map(|e| {
+                        e.args
+                            .iter()
+                            .filter_map(|v| v.as_number().and_then(|n| usize::try_from(n).ok()))
+                            .collect::<Vec<usize>>()
+                    });
+
+                if runtime.is_none() {
+                    let mut runtime_settings = RuntimeSettings::default();
+                    runtime_settings.io_uring_enabled = io_uring_enabled;
+                    runtime_settings.cpu_affinity = cpu_affinity;
+                    runtime = Some(Runtime::new(runtime_settings)?);
+                }
+                let runtime = runtime
+                    .as_mut()
+                    .expect("runtime should be initialized at this point");
+
+                for module in modules {
+                    log_debug!("Starting module: {}", module.name());
+                    module.start(runtime)?;
+                }
+
+                if !first_time {
+                    let mut reload_metrics =
+                        ferron_core::admin::ADMIN_METRICS.reload_metrics.write();
+                    reload_metrics.last_reload_error = None;
+                    reload_metrics.active_generation =
+                        reload_metrics.active_generation.saturating_add(1);
+                }
+
+                // Store config metadata for drift detection
+                {
+                    let mut config_hash = ferron_core::admin::ADMIN_METRICS.config_hash.write();
+                    *config_hash = metadata.config_hash;
+                }
+                {
+                    let mut config_mtime = ferron_core::admin::ADMIN_METRICS.config_mtime.write();
+                    *config_mtime = metadata.config_mtime;
+                }
+                // Store drift metadata and clear drift flag after successful reload
+                {
+                    let mut drift_meta = ferron_core::admin::ADMIN_METRICS
+                        .config_drift_metadata
+                        .write();
+                    *drift_meta = Some(ferron_core::admin::ConfigurationDriftMetadata {
+                        config_files: metadata.config_files,
+                        config_mtime: metadata.config_mtime,
+                    });
+                }
+                ferron_core::admin::ADMIN_METRICS
+                    .config_drift
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+
+                reload_state.1.set_state(None);
+
+                (runtime, watcher)
+            }
+            Err(e) => {
+                if let (Some(runtime), Some(watcher)) =
+                    (runtime.as_mut(), watcher.borrow_mut().take())
+                {
+                    {
+                        let mut reload_metrics =
+                            ferron_core::admin::ADMIN_METRICS.reload_metrics.write();
+                        reload_metrics.last_reload_error = Some(e.to_string());
+                    }
+
+                    reload_state.1.set_state(Some(e.to_string()));
+
+                    (runtime, watcher)
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        // Run the runtime (check for shutdown/reload signal)
+        let watcher = watcher.clone();
+        let shutdown = runtime.block_on(async move {
+            let shutdown_token = SHUTDOWN_TOKEN.load();
+            let reload_token = RELOAD_TOKEN.load();
+            let response = tokio::select! {
+                _ = shutdown_token.cancelled() => {
+                    Ok(true)
+                }
+                _ = reload_token.cancelled() => {
+                    Ok(false)
+                }
+                res = watcher_obtained.watch() => {
+                    res.map(|_| false)
+                }
+            };
+            watcher.borrow_mut().replace(watcher_obtained);
+            response
+        })?;
+
+        if shutdown {
+            log_info!("Shutting down the server...");
+            return Ok(());
+        } else {
+            ferron_core::admin::ADMIN_METRICS
+                .reloads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut reload_metrics = ferron_core::admin::ADMIN_METRICS.reload_metrics.write();
+                reload_metrics.last_reload_time = std::time::SystemTime::now();
+            }
+        }
+    }
+}
+
+fn print_version() {
+    println!("Ferron {}", build::PKG_VERSION);
+    println!("  Compiled on: {}", build::BUILD_TIME);
+    println!("  Git commit: {}", build::COMMIT_HASH);
+    println!("  Build target: {}", build::BUILD_TARGET);
+    println!("  Rust version: {}", build::RUST_VERSION);
+    println!("  Build host: {}", build::BUILD_OS);
+    if cfg!(feature = "fips") {
+        println!("This build is configured to use FIPS-certified cryptography.");
+    }
+    if shadow_rs::is_debug() {
+        println!("WARNING: This is a debug build. It is not recommended for production use.");
+    }
+}
+
+fn print_directives(
+    mut loaders: Vec<Box<dyn ModuleLoader>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut directive_registry = ferron_core::directives::DirectiveRegistry::new();
+    for loader in &mut loaders {
+        loader.register_directives(&mut directive_registry);
+    }
+    let json = serde_json::to_string_pretty(&directive_registry)?;
+    println!("{}", json);
+    Ok(())
+}
+
+#[allow(clippy::type_complexity)]
+fn load_modules_config(
+    config_adapter: &dyn ConfigurationAdapter,
+    config_adapter_params: HashMap<String, String>,
+    loaders: &mut [Box<dyn ModuleLoader>],
+    global_validator_registry: &[Box<dyn ferron_core::config::validator::ConfigurationValidator>],
+    per_protocol_validator_registry: &HashMap<
+        &'static str,
+        Vec<Box<dyn ferron_core::config::validator::ConfigurationValidator>>,
+    >,
+    scoped_validator_registry: Arc<
+        HashMap<
+            ferron_core::config::validator::ConfigurationValidatorScopedKey,
+            Box<dyn ferron_core::config::validator::ConfigurationValidator>,
+        >,
+    >,
+    module_registry: Arc<Registry>,
+) -> Result<
+    (
+        Arc<ferron_core::config::ServerConfiguration>,
+        Box<dyn ferron_core::config::adapter::ConfigurationWatcher>,
+        Vec<Arc<dyn ferron_core::Module>>,
+        ferron_core::config::adapter::ConfigurationMetadata,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let (config, watcher, metadata) = config_adapter
+        .adapt(&config_adapter_params)
+        .map_err(|e| anyhow::anyhow!("Failed to load configuration: {e}"))?;
+    let config = Arc::new(config);
+
+    let mut modules = Vec::new();
+
+    // Configuration validation
+    let mut validation_result = run_configuration_validators(
+        loaders,
+        &config,
+        global_validator_registry,
+        per_protocol_validator_registry,
+        scoped_validator_registry,
+    );
+    // Remove best practice violations from diagnostics, since this is not `ferron doctor`...
+    validation_result.diagnostics.retain(|d| {
+        !matches!(
+            d.kind,
+            ConfigurationValidatorDiagnosticKind::BestPracticeViolation
+        )
+    });
+    print_validation_result(validation_result, false)?;
+
+    for loader in loaders {
+        loader.register_modules(module_registry.clone(), &mut modules, config.clone())?;
+    }
+
+    Ok((config, watcher, modules, metadata))
+}

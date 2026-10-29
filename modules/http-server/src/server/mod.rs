@@ -1,0 +1,1465 @@
+//! HTTP server implementation
+//!
+//! # Why two HTTP modules?
+//!
+//! `server/` is split into two `Module` implementations that share `HttpServerConfig`
+//! construction but have different lifecycles:
+//!
+//! * `BasicHttpModule`: TCP (and QUIC) per-port. One instance per `ServerConfigurationPort`
+//!   (e.g. `:80` and `:443`). Each instance owns its `HttpServerConfig` built from that
+//!   port's hosts, its `TcpListenerHandle`/`QuicListenerHandle`, and its `port`/`https_port`.
+//!   Port-scoped state makes reload/merge logic simple (`loader.rs` expands `*:80`/`*:443`).
+//!
+//! * `UnixHttpModule` (`#[cfg(unix)]` only): global Unix domain sockets. Exactly one
+//!   instance for the whole server, built from the *merged* host list of all `http` ports
+//!   (`loader.rs` collects `all_hosts`). It has no TCP port and owns only
+//!   `UnixListenerHandle`s. Remaining Unix-specific concerns — path validation, `sun_path`
+//!   length, duplicate detection, `mode`/`owner`/`group` (octal string), stale-socket
+//!   unlink, parent-dir creation via `socket2` — live in `unix.rs`.
+//!
+//! Both call `BasicHttpModule::build_config_inner(..., is_unix)` so TLS, observability and
+//! connection options are resolved identically. `is_unix` only relaxes the
+//! `port == https_port` gate for explicit TLS and requires `https_port.is_some()` for
+//! implicit (ACME/local) TLS. This keeps TCP port-selection logic out of the Unix path
+//! while reusing the common `TlsResolver`/`observability`/`ThreeStageResolver` machinery.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use ferron_core::config::{
+    ServerConfigurationBlock, ServerConfigurationDirectiveEntry, ServerConfigurationHostFilters,
+    ServerConfigurationValue,
+};
+use ferron_core::pipeline::Pipeline;
+use ferron_core::runtime::Runtime;
+use ferron_core::Module;
+use ferron_http::{HttpContext, HttpErrorContext, HttpFileContext};
+use ferron_observability::sampler::TraceSamplingConfig;
+use ferron_observability::{ObservabilityConfigExtractor, ObservabilityContext};
+use ferron_tls::{TlsContext, TlsResolver};
+use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::{
+    prepare_host_config, resolve_trace_settings, HttpTraceSettings, ThreeStageResolver,
+};
+use crate::server::quic::{QuicTlsResolver, QuicTlsSniResolvers};
+use crate::server::sni::CustomSniResolver;
+use crate::server::tls_resolve::{RadixTree, TlsResolverRadixTree};
+
+mod common;
+mod native_sockets;
+mod quic;
+mod sni;
+mod tcp;
+mod tls_resolve;
+#[cfg(unix)]
+mod unix;
+
+type ObservabilityProviderEntry = (
+    Arc<dyn ferron_core::providers::Provider<ObservabilityContext>>,
+    Arc<ferron_core::config::ServerConfigurationBlock>,
+    Option<Arc<std::collections::BTreeMap<String, String>>>,
+    Option<Arc<Vec<ferron_observability::control_plane::SpanLinkConfig>>>,
+);
+
+/// Configuration that can be atomically swapped during reload.
+/// Contains all reloadable state for the HTTP server module.
+pub struct HttpServerConfig {
+    pub pipeline: Arc<Pipeline<HttpContext>>,
+    pub file_pipeline: Arc<Pipeline<HttpFileContext>>,
+    pub error_pipeline: Arc<Pipeline<HttpErrorContext>>,
+    pub global_config: Arc<ferron_core::config::ServerConfigurationBlock>,
+    pub config_resolver: Arc<crate::config::ThreeStageResolver>,
+    pub tls_resolver: Option<Arc<self::tls_resolve::TlsResolverRadixTree>>,
+    pub quic_tls_resolver: Option<Arc<QuicTlsResolver>>,
+    pub http_connection_options_resolver:
+        Arc<self::tls_resolve::RadixTree<common::HttpConnectionOptions>>,
+    pub observability_resolver: Arc<self::tls_resolve::RadixTree<Vec<ObservabilityProviderEntry>>>,
+    /// Per-host `http { trace { generate, trust_request }, trace_sampling }` settings.
+    ///
+    /// Looked up per request because the request span and the propagated trace
+    /// context are created before location resolution.
+    pub trace_settings_resolver: Arc<self::tls_resolve::RadixTree<Arc<HttpTraceSettings>>>,
+    /// Parsed trace sampling configuration from the *global*
+    /// `http { trace_sampling ... }` block.
+    ///
+    /// Used for sinks that are resolved before a request (and therefore a host)
+    /// is known: listener, TLS handshake, and connection errors. Per-request
+    /// sinks use `trace_settings_resolver` instead.
+    pub trace_sampling: ferron_observability::sampler::TraceSamplingConfig,
+    /// Whether PROXY protocol v1/v2 parsing is enabled for this listener.
+    ///
+    /// The PROXY header is read while accepting the connection, before the
+    /// request (and therefore the host) exists. Ferron reads the setting from
+    /// the global `http` block or from the host block without a hostname for
+    /// this port. A named host block cannot enable it.
+    pub proxy_protocol_enabled: bool,
+    /// Token that is cancelled when configuration is reloaded to gracefully shut down existing connections.
+    pub reload_token: CancellationToken,
+    /// The canonical HTTPS port for this server (default: 443).
+    /// Used for HTTP-to-HTTPS redirects and URL generation.
+    /// `None` if HTTPS is disabled or not applicable for this listener.
+    pub https_port: Option<u16>,
+}
+
+type ConfigArcSwap = Arc<ArcSwap<HttpServerConfig>>;
+
+#[inline]
+fn get_host_config_iter<'a>(
+    port_config: &'a ferron_core::config::ServerConfigurationPort,
+) -> impl Iterator<Item = &'a ferron_core::config::ServerConfigurationBlock> + 'a {
+    port_config
+        .hosts
+        .iter()
+        .flat_map(|(_, block)| get_blocks_config_iter(block))
+}
+
+#[inline]
+fn get_blocks_config_iter<'a>(
+    block: &'a ferron_core::config::ServerConfigurationBlock,
+) -> Box<dyn Iterator<Item = &'a ferron_core::config::ServerConfigurationBlock> + 'a> {
+    Box::new(
+        std::iter::once(block)
+            .chain(
+                block
+                    .directives
+                    .get("if")
+                    .map_or(([]).iter(), |entries| entries.iter())
+                    .filter_map(|entry| entry.children.as_ref())
+                    .flat_map(get_blocks_config_iter),
+            )
+            .chain(
+                block
+                    .directives
+                    .get("if_not")
+                    .map_or(([]).iter(), |entries| entries.iter())
+                    .filter_map(|entry| entry.children.as_ref())
+                    .flat_map(get_blocks_config_iter),
+            )
+            .chain(
+                block
+                    .directives
+                    .get("handle_error")
+                    .map_or(([]).iter(), |entries| entries.iter())
+                    .filter_map(|entry| entry.children.as_ref())
+                    .flat_map(get_blocks_config_iter),
+            )
+            .chain(
+                block
+                    .directives
+                    .get("location")
+                    .map_or(([]).iter(), |entries| entries.iter())
+                    .filter_map(|entry| entry.children.as_ref())
+                    .flat_map(get_blocks_config_iter),
+            ),
+    )
+}
+
+#[inline]
+fn format_location(
+    block_name: Option<&str>,
+    span: Option<&ferron_core::config::ServerConfigurationSpan>,
+) -> String {
+    let mut location = String::new();
+    if let Some(name) = block_name {
+        location.push_str(&format!("block '{}'", name));
+    }
+    if let Some(span) = span {
+        if let Some(file) = &span.file {
+            location.push_str(&format!("in file '{}' ", file));
+        }
+        location.push_str(&format!("at line {}", span.line));
+        location.push_str(&format!(", column {}", span.column));
+    }
+    location
+}
+
+#[inline]
+fn tcp_config(global_config: &ServerConfigurationBlock) -> Option<&ServerConfigurationBlock> {
+    global_config
+        .directives
+        .get("tcp")
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.children.as_ref())
+}
+
+fn resolve_tcp_buffer_size(
+    tcp_config: Option<&ServerConfigurationBlock>,
+    directive: &str,
+) -> anyhow::Result<Option<usize>> {
+    let Some(value) = tcp_config.and_then(|config| config.get_value(directive)) else {
+        return Ok(None);
+    };
+
+    let Some(size) = value.as_number() else {
+        anyhow::bail!("tcp.{directive} must be a number");
+    };
+
+    Ok(Some(usize::try_from(size).map_err(|_| {
+        anyhow::anyhow!("tcp.{directive} must be a non-negative integer")
+    })?))
+}
+
+fn resolve_tcp_listener_options(
+    global_config: &ServerConfigurationBlock,
+    port: u16,
+) -> anyhow::Result<tcp::TcpListenerOptions> {
+    let tcp_config = tcp_config(global_config);
+    let address = match tcp_config
+        .and_then(|config| config.directives.get("listen"))
+        .and_then(|e| e.first())
+        .filter(|e| !e.args.is_empty())
+        .map(|e| &e.args)
+    {
+        Some(value) => {
+            let mut listen_vec = Vec::with_capacity(value.len());
+            for value_one in value {
+                let listen = value_one
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("tcp.listen must be a string"))?;
+
+                let listen_one = if let Ok(address) = listen.parse::<SocketAddr>() {
+                    if address.port() != port {
+                        anyhow::bail!(
+                            "tcp.listen address port {} does not match the configured HTTP port {}",
+                            address.port(),
+                            port
+                        );
+                    }
+                    address
+                } else {
+                    SocketAddr::new(
+                        listen.parse::<IpAddr>().map_err(|_| {
+                            anyhow::anyhow!("Invalid tcp.listen address '{listen}'")
+                        })?,
+                        port,
+                    )
+                };
+                listen_vec.push(listen_one);
+            }
+            listen_vec
+        }
+        None => vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)],
+    };
+
+    let multipath = tcp_config
+        .map(|config| config.get_flag("multipath"))
+        .unwrap_or(false);
+
+    let backlog = match tcp_config.and_then(|config| config.get_value("backlog")) {
+        Some(value) => {
+            let Some(size) = value.as_number() else {
+                anyhow::bail!("tcp.backlog must be a number");
+            };
+
+            Some(
+                i32::try_from(size)
+                    .map_err(|_| anyhow::anyhow!("tcp.backlog must be a non-negative integer"))?,
+            )
+        }
+        None => None,
+    };
+
+    Ok(tcp::TcpListenerOptions {
+        address,
+        send_buffer_size: resolve_tcp_buffer_size(tcp_config, "send_buf")?,
+        recv_buffer_size: resolve_tcp_buffer_size(tcp_config, "recv_buf")?,
+        backlog,
+        multipath,
+    })
+}
+
+#[inline]
+fn http_config(config: &ServerConfigurationBlock) -> Option<&ServerConfigurationBlock> {
+    config
+        .directives
+        .get("http")
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.children.as_ref())
+}
+
+fn resolve_http_u32(
+    http_config: Option<&ServerConfigurationBlock>,
+    directive: &str,
+) -> anyhow::Result<Option<u32>> {
+    resolve_http_u32_in_range(http_config, directive, None)
+}
+
+/// Protocol-mandated bounds for `h2_initial_window_size`.
+const H2_INITIAL_WINDOW_SIZE_RANGE: std::ops::RangeInclusive<u32> = 0..=(1 << 31) - 1;
+
+/// Protocol-mandated bounds for `h2_max_frame_size`.
+const H2_MAX_FRAME_SIZE_RANGE: std::ops::RangeInclusive<u32> = 16_384..=16_777_215;
+
+fn resolve_http_u32_in_range(
+    http_config: Option<&ServerConfigurationBlock>,
+    directive: &str,
+    valid_range: Option<std::ops::RangeInclusive<u32>>,
+) -> anyhow::Result<Option<u32>> {
+    let Some(value) = http_config.and_then(|config| config.get_value(directive)) else {
+        return Ok(None);
+    };
+
+    let Some(size) = value.as_number() else {
+        anyhow::bail!("http.{directive} must be a number");
+    };
+
+    let parsed = u32::try_from(size)
+        .map_err(|_| anyhow::anyhow!("http.{directive} must be a non-negative integer"))?;
+
+    if let Some(range) = valid_range {
+        if !range.contains(&parsed) {
+            anyhow::bail!(
+                "http.{directive} must be between {} and {}",
+                range.start(),
+                range.end()
+            );
+        }
+    }
+
+    Ok(Some(parsed))
+}
+
+fn resolve_http_u64(
+    http_config: Option<&ServerConfigurationBlock>,
+    directive: &str,
+) -> anyhow::Result<Option<u64>> {
+    let Some(value) = http_config.and_then(|config| config.get_value(directive)) else {
+        return Ok(None);
+    };
+
+    let Some(size) = value.as_number() else {
+        anyhow::bail!("http.{directive} must be a number");
+    };
+
+    Ok(Some(u64::try_from(size).map_err(|_| {
+        anyhow::anyhow!("http.{directive} must be a non-negative integer")
+    })?))
+}
+
+/// Check the `http` block settings that have protocol-mandated value ranges.
+///
+/// Called from the configuration validator so that `ferron validate` reports
+/// out-of-range values instead of leaving them to fail at server start.
+pub(crate) fn validate_http_settings(
+    http_config: Option<&ServerConfigurationBlock>,
+) -> anyhow::Result<()> {
+    resolve_http_u32_in_range(
+        http_config,
+        "h2_initial_window_size",
+        Some(H2_INITIAL_WINDOW_SIZE_RANGE),
+    )?;
+    resolve_http_u32_in_range(
+        http_config,
+        "h2_max_frame_size",
+        Some(H2_MAX_FRAME_SIZE_RANGE),
+    )?;
+    Ok(())
+}
+
+/// Merge the global `http` block with a host block's `http` block.
+///
+/// Connection options are read from host scope before routing, so the two
+/// `http` blocks are layered per directive here. A directive the host block
+/// does not set keeps the global value, which matches how directives in every
+/// other Ferron block inherit. Replacing the whole block would silently drop
+/// the global settings for directives the host did not mention.
+fn effective_http_config(
+    global_config: &ServerConfigurationBlock,
+    config: &ServerConfigurationBlock,
+) -> Option<ServerConfigurationBlock> {
+    let global_http = http_config(global_config);
+    let host_http = http_config(config);
+
+    let Some(host_http) = host_http else {
+        return global_http.cloned();
+    };
+
+    let mut directives: rustc_hash::FxHashMap<String, Vec<ServerConfigurationDirectiveEntry>> =
+        global_http.map_or_else(rustc_hash::FxHashMap::default, |block| {
+            (*block.directives).clone()
+        });
+    for (directive, entries) in host_http.directives.iter() {
+        directives.insert(directive.clone(), entries.clone());
+    }
+
+    Some(ServerConfigurationBlock {
+        directives: Arc::new(directives),
+        matchers: rustc_hash::FxHashMap::default(),
+        span: None,
+    })
+}
+
+pub(crate) fn resolve_http_protocols(
+    http_config: Option<&ServerConfigurationBlock>,
+) -> anyhow::Result<common::HttpProtocols> {
+    let Some(protocols_entry) = http_config
+        .and_then(|config| config.directives.get("protocols"))
+        .and_then(|entries| entries.first())
+    else {
+        return Ok(common::HttpProtocols::default());
+    };
+
+    let mut protocols = common::HttpProtocols::empty();
+    for value in &protocols_entry.args {
+        let protocol = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("http.protocols values must be strings"))?;
+        match protocol {
+            "h1" => protocols.http1 = true,
+            "h2" => protocols.http2 = true,
+            "h2c" => protocols.http2_cleartext = true,
+            "h3" => protocols.http3 = true,
+            unsupported => anyhow::bail!("Unsupported HTTP protocol '{unsupported}'"),
+        }
+    }
+
+    if !protocols.http1 && !protocols.http2 && !protocols.http2_cleartext && !protocols.http3 {
+        anyhow::bail!("http.protocols must enable at least one supported protocol");
+    } else if protocols.http1 && protocols.http2_cleartext {
+        anyhow::bail!("Plaintext HTTP/1.x and HTTP/2 over cleartext are mutually exclusive")
+    }
+
+    Ok(protocols)
+}
+
+fn resolve_http_connection_options(
+    global_config: &ServerConfigurationBlock,
+    config: &ServerConfigurationBlock,
+) -> anyhow::Result<common::HttpConnectionOptions> {
+    let effective_http = effective_http_config(global_config, config);
+    let http_config = effective_http.as_ref();
+    Ok(common::HttpConnectionOptions {
+        timeout: http_config
+            .and_then(|config| config.get_value("timeout"))
+            .map_or(Some(std::time::Duration::from_secs(300)), |value| {
+                if !value.as_boolean().unwrap_or(true) {
+                    None
+                } else {
+                    Some(
+                        value
+                            .as_duration()
+                            .unwrap_or(std::time::Duration::from_secs(300)),
+                    )
+                }
+            }),
+        protocols: resolve_http_protocols(http_config)?,
+        h1_enable_early_hints: http_config
+            .is_some_and(|config| config.get_flag("h1_enable_early_hints")),
+        h2: common::Http2Settings {
+            // SETTINGS_MAX_FRAME_SIZE and SETTINGS_INITIAL_WINDOW_SIZE have
+            // protocol-mandated bounds. Advertising a value outside them makes
+            // conforming clients treat the connection as malformed.
+            initial_window_size: resolve_http_u32_in_range(
+                http_config,
+                "h2_initial_window_size",
+                Some(H2_INITIAL_WINDOW_SIZE_RANGE),
+            )?,
+            max_frame_size: resolve_http_u32_in_range(
+                http_config,
+                "h2_max_frame_size",
+                Some(H2_MAX_FRAME_SIZE_RANGE),
+            )?,
+            max_concurrent_streams: resolve_http_u32(http_config, "h2_max_concurrent_streams")?,
+            max_header_list_size: resolve_http_u32(http_config, "h2_max_header_list_size")?,
+            enable_connect_protocol: http_config
+                .is_some_and(|config| config.get_flag("h2_enable_connect_protocol")),
+        },
+        h3: common::Http3Settings {
+            qpack_max_table_capacity: resolve_http_u64(http_config, "h3_qpack_max_table_capacity")?,
+            qpack_blocked_streams: resolve_http_u64(http_config, "h3_qpack_blocked_streams")?,
+            max_field_section_size: resolve_http_u64(http_config, "h3_max_field_section_size")?,
+            enable_connect_protocol: http_config
+                .is_some_and(|config| config.get_flag("h3_enable_connect_protocol")),
+        },
+        proxy_protocol_enabled: http_config.is_some_and(|config| config.get_flag("protocol_proxy")),
+    })
+}
+
+#[inline]
+fn lookup_tls(
+    tls_resolver: &TlsResolverRadixTree,
+    ip: Option<IpAddr>,
+    host: Option<&str>,
+) -> Option<Arc<dyn TlsResolver>> {
+    match (ip, host) {
+        (Some(ip), Some(host)) => tls_resolver.lookup_ip_and_hostname(ip, host),
+        (Some(ip), None) => tls_resolver.lookup_ip(ip),
+        (None, Some(host)) => tls_resolver.lookup_hostname(host),
+        (None, None) => tls_resolver.root_data(),
+    }
+}
+
+fn implicit_tls_applicable(
+    tls_resolver: &TlsResolverRadixTree,
+    host_config: &ServerConfigurationHostFilters,
+) -> bool {
+    let mut arc = None;
+    let ip = host_config.ip;
+    let mut host = host_config.host.as_deref();
+    for _ in 0..2 {
+        let Some(new_arc) = lookup_tls(tls_resolver, ip, host) else {
+            return arc.is_none();
+        };
+        if let Some(arc) = &arc {
+            if !Arc::ptr_eq(arc, &new_arc) {
+                // Maybe different levels have different resolvers,
+                // like *.api.example.com and *.example.com...
+                return false;
+            }
+        } else {
+            arc = Some(new_arc);
+        }
+
+        if host.is_some_and(|h| h == "*" || h.starts_with("*.")) {
+            // Nested wildcards...
+            break;
+        }
+
+        host = if let Some(host) = host {
+            host.trim_end_matches('.')
+                .split_once('.')
+                .map(|(_, remaining)| remaining)
+        } else {
+            break;
+        };
+    }
+
+    arc.is_some()
+}
+
+/// TCP/QUIC HTTP listener — one instance per TCP port.
+/// See module-level docs for why this is separate from `UnixHttpModule`.
+pub struct BasicHttpModule {
+    config: ConfigArcSwap,
+    listeners: Mutex<Vec<tcp::TcpListenerHandle>>,
+    quic_listeners: Mutex<Vec<quic::QuicListenerHandle>>,
+    port: u16,
+}
+
+impl BasicHttpModule {
+    /// Build the HTTP server configuration from the given port and global config.
+    /// This is used by both `new()` and `reload()`.
+    fn build_config(
+        registry: &ferron_core::registry::Registry,
+        port_config: &ferron_core::config::ServerConfigurationPort,
+        global_config: Arc<ferron_core::config::ServerConfigurationBlock>,
+        https_port: Option<u16>,
+        explicit_port: bool,
+    ) -> Result<HttpServerConfig, Box<dyn std::error::Error>> {
+        Self::build_config_inner(
+            registry,
+            port_config,
+            global_config,
+            https_port,
+            explicit_port,
+            false,
+        )
+    }
+
+    pub(crate) fn build_config_inner(
+        registry: &ferron_core::registry::Registry,
+        port_config: &ferron_core::config::ServerConfigurationPort,
+        global_config: Arc<ferron_core::config::ServerConfigurationBlock>,
+        https_port: Option<u16>,
+        explicit_port: bool,
+        is_unix: bool,
+    ) -> Result<HttpServerConfig, Box<dyn std::error::Error>> {
+        let mut enable_tls = false;
+        let mut http_connection_options_resolver = RadixTree::new();
+        let mut observability_resolver = RadixTree::new();
+        let mut trace_settings_resolver: RadixTree<Arc<HttpTraceSettings>> = RadixTree::new();
+        let mut tls_resolver = TlsResolverRadixTree::new();
+
+        // Global trace settings act as the fallback for every host. Each host
+        // below re-resolves the settings with its own block layered on top, so
+        // this root entry only serves requests that match no host block at all.
+        trace_settings_resolver.set_root_data(Arc::new(resolve_trace_settings(
+            Some(global_config.as_ref()),
+            None,
+        )));
+
+        // The PROXY protocol header arrives before the request, so it cannot be
+        // enabled per named host. Read it from the global `http` block and let
+        // the host block without a hostname override it below.
+        let mut proxy_protocol_enabled =
+            http_config(&global_config).is_some_and(|config| config.get_flag("protocol_proxy"));
+
+        // Process global observability configuration (applies to all hosts)
+        let global_observability_extractor = ObservabilityConfigExtractor::new(&global_config);
+        let global_observability_entries: Vec<ObservabilityProviderEntry> =
+            global_observability_extractor
+                .extract_observability_blocks()?
+                .into_iter()
+                .filter_map(|observability_block| {
+                    let observability_provider_name = match observability_block
+                        .get_value("provider")
+                        .and_then(|v| v.as_str())
+                    {
+                        Some(name) => name.to_string(),
+                        None => {
+                            // Error will be handled by host-level extraction if provider is missing there
+                            return None;
+                        }
+                    };
+
+                    registry
+                        .get_provider_registry::<ObservabilityContext>()
+                        .and_then(|observability_registry| {
+                            observability_registry
+                                .get(&observability_provider_name)
+                                .map(|provider| {
+                                    let observability_block_arc = Arc::new(observability_block);
+                                    let cp_config =
+                                        ferron_observability::control_plane::ControlPlaneConfig::from_block(
+                                            &global_config,
+                                        );
+                                    let cp_metadata =
+                                        cp_config.as_ref().map(|c| c.metadata.clone());
+                                    let cp_span_links =
+                                        cp_config.as_ref().map(|c| c.span_links.clone());
+                                    (
+                                        provider,
+                                        observability_block_arc,
+                                        cp_metadata,
+                                        cp_span_links,
+                                    )
+                                })
+                        })
+                })
+                .collect();
+
+        // If global observability entries exist, set them as root data (fallback for all hosts)
+        if !global_observability_entries.is_empty() {
+            observability_resolver.set_root_data(global_observability_entries);
+        }
+
+        let mut quic_tls_resolver = None;
+        for host_config in &port_config.hosts {
+            let http_connection_options =
+                resolve_http_connection_options(&global_config, &host_config.1).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Can't determine HTTP connection options ({}): {e}",
+                        format_location(None, host_config.1.span.as_ref())
+                    )
+                })?;
+            match (&host_config.0.host, host_config.0.ip) {
+                (Some(host), Some(ip)) => {
+                    http_connection_options_resolver.insert_ip_and_hostname(
+                        ip,
+                        host,
+                        http_connection_options.clone(),
+                    );
+                }
+                (Some(host), None) => {
+                    http_connection_options_resolver
+                        .insert_hostname(host, http_connection_options.clone());
+                }
+                (None, Some(ip)) => {
+                    http_connection_options_resolver.insert_ip(ip, http_connection_options.clone());
+                }
+                (None, None) => {
+                    http_connection_options_resolver.set_root_data(http_connection_options.clone());
+                    proxy_protocol_enabled = http_connection_options.proxy_protocol_enabled;
+                }
+            }
+
+            // Trace settings are resolved per host because the request span is
+            // created before location resolution. Layer the host block over the
+            // global block exactly like `resolve_http_connection_options` does.
+            let trace_settings = Arc::new(resolve_trace_settings(
+                Some(global_config.as_ref()),
+                Some(&host_config.1),
+            ));
+            match (&host_config.0.host, host_config.0.ip) {
+                (Some(host), Some(ip)) => {
+                    trace_settings_resolver.insert_ip_and_hostname(
+                        ip,
+                        host,
+                        Arc::clone(&trace_settings),
+                    );
+                }
+                (Some(host), None) => {
+                    trace_settings_resolver.insert_hostname(host, trace_settings);
+                }
+                (None, Some(ip)) => {
+                    trace_settings_resolver.insert_ip(ip, trace_settings);
+                }
+                (None, None) => {
+                    trace_settings_resolver.set_root_data(trace_settings);
+                }
+            }
+
+            // Only process TLS directives on the HTTPS listener.
+            // The plaintext HTTP listener (port != https_port) ignores all `tls` directives,
+            // including explicit configurations and automatic ACME.
+            // Unix listeners (is_unix) always process TLS if present.
+            if is_unix || (https_port.is_some() && port_config.port == https_port) {
+                if let Some(tls) = host_config.1.directives.get("tls") {
+                    for tls1 in tls {
+                        if tls1
+                            .args
+                            .first()
+                            .and_then(|a| a.as_boolean())
+                            .is_some_and(|v| !v)
+                        {
+                            continue;
+                        }
+                        let host_config_with_arc =
+                            (host_config.0.clone(), Arc::new(host_config.1.clone()));
+                        Self::process_tls_directive(
+                            registry,
+                            tls1,
+                            &host_config_with_arc,
+                            &http_connection_options,
+                            port_config,
+                            &mut tls_resolver,
+                            &mut quic_tls_resolver,
+                            &mut enable_tls,
+                        )?;
+                    }
+                }
+            }
+
+            // Process observability using the config extractor (handles both explicit blocks and aliases)
+            let observability_extractor = ObservabilityConfigExtractor::new(&host_config.1);
+            let mut observability_entries_map: rustc_hash::FxHashMap<
+                (Option<String>, Option<IpAddr>),
+                Vec<ObservabilityProviderEntry>,
+            > = Default::default();
+            for observability_block in observability_extractor.extract_observability_blocks()? {
+                let observability_provider_name = observability_block
+                    .get_value("provider")
+                    .ok_or(anyhow::anyhow!(
+                        "Observability provider not specified ({})",
+                        format_location(None, observability_block.span.as_ref())
+                    ))?
+                    .as_str()
+                    .ok_or(anyhow::anyhow!(
+                        "Observability provider must be a string ({})",
+                        format_location(None, observability_block.span.as_ref())
+                    ))?;
+
+                if let Some(observability_registry) =
+                    registry.get_provider_registry::<ObservabilityContext>()
+                {
+                    let observability_provider = observability_registry
+                        .get(observability_provider_name)
+                        .ok_or(anyhow::anyhow!(
+                            "Observability provider '{observability_provider_name}' not found ({})",
+                            format_location(None, observability_block.span.as_ref())
+                        ))?;
+
+                    let observability_block_arc = Arc::new(observability_block);
+
+                    // Extract control_plane metadata and span links from the host block,
+                    // falling back to the global block when the host defines none.
+                    // This mirrors `ControlPlaneConfig::from_layered` whole-block
+                    // precedence used for post-resolution events.
+                    let cp_config =
+                        ferron_observability::control_plane::ControlPlaneConfig::from_block(
+                            &host_config.1,
+                        )
+                        .or_else(|| {
+                            ferron_observability::control_plane::ControlPlaneConfig::from_block(
+                                &global_config,
+                            )
+                        });
+                    let cp_metadata = cp_config.as_ref().map(|c| c.metadata.clone());
+                    let cp_span_links = cp_config.as_ref().map(|c| c.span_links.clone());
+
+                    let entry: ObservabilityProviderEntry = (
+                        observability_provider,
+                        observability_block_arc.clone(),
+                        cp_metadata,
+                        cp_span_links,
+                    );
+                    {
+                        let mut context = ObservabilityContext {
+                            sink: None,
+                            control_plane_metadata: entry.2.clone(),
+                            log_config: observability_block_arc.clone(),
+                        };
+                        let _ = entry.0.execute(&mut context);
+                    }
+                    observability_entries_map
+                        .entry((host_config.0.host.clone(), host_config.0.ip))
+                        .or_default()
+                        .push(entry);
+                }
+            }
+            for (key, entry) in observability_entries_map {
+                match key {
+                    (Some(host), Some(ip)) => {
+                        observability_resolver.insert_ip_and_hostname(ip, &host, entry);
+                    }
+                    (Some(host), None) => {
+                        observability_resolver.insert_hostname(&host, entry);
+                    }
+                    (None, Some(ip)) => {
+                        observability_resolver.insert_ip(ip, entry);
+                    }
+                    (None, None) => {
+                        observability_resolver.set_root_data(entry);
+                    }
+                }
+            }
+        }
+
+        // Another loop pass, for implicit TLS
+        for host_config in &port_config.hosts {
+            if https_port.is_some()
+                && (is_unix || (port_config.port == https_port && !explicit_port))
+                && host_config.1.directives.get("tls").is_none()
+                && implicit_tls_applicable(&tls_resolver, &host_config.0)
+            {
+                let http_connection_options =
+                    resolve_http_connection_options(&global_config, &host_config.1).map_err(
+                        |e| {
+                            anyhow::anyhow!(
+                                "Can't determine HTTP connection options ({}): {e}",
+                                format_location(None, host_config.1.span.as_ref())
+                            )
+                        },
+                    )?;
+                if let Some(tls) = global_config.directives.get("tls") {
+                    for tls1 in tls {
+                        // Global `tls` directive present
+                        // Handle explicit `tls false`, skip TLS entirely
+                        if tls1
+                            .args
+                            .first()
+                            .and_then(|a| a.as_boolean())
+                            .is_some_and(|v| !v)
+                        {
+                            continue;
+                        }
+                        let host_config_with_arc =
+                            (host_config.0.clone(), Arc::new(host_config.1.clone()));
+                        Self::process_tls_directive(
+                            registry,
+                            tls1,
+                            &host_config_with_arc,
+                            &http_connection_options,
+                            port_config,
+                            &mut tls_resolver,
+                            &mut quic_tls_resolver,
+                            &mut enable_tls,
+                        )?;
+                    }
+                } else {
+                    // No `tls` directive present, automatically select provider (ACME or Local)
+
+                    let hostname = host_config.0.host.as_deref();
+                    let ip = host_config.0.ip.map(|ip| ip.to_string());
+                    let auto_selection = crate::tls_auto::select_auto_tls_provider(
+                        registry,
+                        hostname,
+                        ip.as_deref(),
+                    );
+
+                    match auto_selection {
+                        crate::tls_auto::TlsAutoSelection::Local => {
+                            let synthetic_tls_entry =
+                                crate::tls_auto::create_synthetic_tls_directive("local");
+                            let host_config_with_arc =
+                                (host_config.0.clone(), Arc::new(host_config.1.clone()));
+                            Self::process_tls_directive(
+                                registry,
+                                &synthetic_tls_entry,
+                                &host_config_with_arc,
+                                &http_connection_options,
+                                port_config,
+                                &mut tls_resolver,
+                                &mut quic_tls_resolver,
+                                &mut enable_tls,
+                            )?;
+                        }
+                        crate::tls_auto::TlsAutoSelection::Acme => {
+                            let synthetic_tls_entry =
+                                crate::tls_auto::create_synthetic_tls_directive("acme");
+                            let host_config_with_arc =
+                                (host_config.0.clone(), Arc::new(host_config.1.clone()));
+                            Self::process_tls_directive(
+                                registry,
+                                &synthetic_tls_entry,
+                                &host_config_with_arc,
+                                &http_connection_options,
+                                port_config,
+                                &mut tls_resolver,
+                                &mut quic_tls_resolver,
+                                &mut enable_tls,
+                            )?;
+                        }
+                        crate::tls_auto::TlsAutoSelection::None => {}
+                    }
+                }
+            }
+        }
+
+        // Build a merged config from global + all host blocks so that
+        // `is_applicable` includes a stage if any host uses its directive.
+        let port_config_merged = ferron_core::config::ServerConfigurationBlock::merge_from(
+            std::iter::once(global_config.as_ref()).chain(get_host_config_iter(port_config)),
+        );
+        let merged_config = Some(&port_config_merged);
+        let pipeline = registry
+            .get_stage_registry::<HttpContext>()
+            .expect("HTTP stage registry not found")
+            .build_with_config(merged_config);
+        let file_pipeline = registry
+            .get_stage_registry::<HttpFileContext>()
+            .map(|registry| registry.build_with_config(merged_config))
+            .unwrap_or_default();
+        let error_pipeline = registry
+            .get_stage_registry::<HttpErrorContext>()
+            .map(|registry| registry.build_with_config(merged_config))
+            .unwrap_or_default();
+
+        Ok(HttpServerConfig {
+            pipeline: Arc::new(pipeline),
+            file_pipeline: Arc::new(file_pipeline),
+            error_pipeline: Arc::new(error_pipeline),
+            global_config: global_config.clone(),
+            config_resolver: Arc::new(ThreeStageResolver::from_prepared_with_global(
+                prepare_host_config(port_config.clone())?,
+                global_config.clone(),
+            )),
+            tls_resolver: if enable_tls {
+                Some(Arc::new(tls_resolver))
+            } else {
+                None
+            },
+            quic_tls_resolver: if let Some(quic_resolver) = quic_tls_resolver {
+                Some(Arc::new(quic_resolver.try_into()?))
+            } else {
+                None
+            },
+            http_connection_options_resolver: Arc::new(http_connection_options_resolver),
+            observability_resolver: Arc::new(observability_resolver),
+            trace_settings_resolver: Arc::new(trace_settings_resolver),
+            trace_sampling: global_config
+                .directives
+                .get("http")
+                .and_then(|entries| entries.first())
+                .and_then(|e| e.children.as_ref())
+                .and_then(|c| c.directives.get("trace_sampling"))
+                .and_then(|entries| entries.first())
+                .map_or(
+                    TraceSamplingConfig::default(),
+                    ferron_observability::sampler::parse_trace_sampling_config,
+                ),
+            proxy_protocol_enabled,
+            reload_token: CancellationToken::new(),
+            https_port,
+        })
+    }
+
+    /// Process a single TLS directive entry (from either explicit config or synthetic ACME).
+    #[allow(clippy::too_many_arguments)]
+    fn process_tls_directive(
+        registry: &ferron_core::registry::Registry,
+        tls1: &ServerConfigurationDirectiveEntry,
+        host_config: &(
+            ferron_core::config::ServerConfigurationHostFilters,
+            Arc<ferron_core::config::ServerConfigurationBlock>,
+        ),
+        http_connection_options: &common::HttpConnectionOptions,
+        port_config: &ferron_core::config::ServerConfigurationPort,
+        tls_resolver: &mut TlsResolverRadixTree,
+        quic_tls_resolver: &mut Option<QuicTlsSniResolvers>,
+        enable_tls: &mut bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        *enable_tls = true;
+        let mut children = tls1.children.clone().unwrap_or_default();
+
+        // Handle the shorthand form: `tls /path/cert.pem /path/key.pem`
+        if let (Some(cert), Some(key)) = (
+            tls1.args
+                .first()
+                .and_then(|v| v.as_string_with_interpolations(&HashMap::new())),
+            tls1.args
+                .get(1)
+                .and_then(|v| v.as_string_with_interpolations(&HashMap::new())),
+        ) {
+            let mut directives = (*children.directives).clone();
+            directives.insert(
+                "provider".to_string(),
+                vec![ServerConfigurationDirectiveEntry {
+                    args: vec![ServerConfigurationValue::String("manual".to_string(), None)],
+                    ..Default::default()
+                }],
+            );
+            directives.insert(
+                "cert".to_string(),
+                vec![ServerConfigurationDirectiveEntry {
+                    args: vec![ServerConfigurationValue::String(cert, None)],
+                    ..Default::default()
+                }],
+            );
+            directives.insert(
+                "key".to_string(),
+                vec![ServerConfigurationDirectiveEntry {
+                    args: vec![ServerConfigurationValue::String(key, None)],
+                    ..Default::default()
+                }],
+            );
+            children.directives = Arc::new(directives);
+        }
+
+        let tls_provider_name = children
+            .get_value("provider")
+            .ok_or(anyhow::anyhow!(
+                "TLS provider not specified ({})",
+                format_location(None, tls1.span.as_ref())
+            ))?
+            .as_str()
+            .ok_or(anyhow::anyhow!(
+                "TLS provider must be a string ({})",
+                format_location(None, tls1.span.as_ref())
+            ))?;
+
+        if let Some(tls_registry) = registry.get_provider_registry::<TlsContext>() {
+            let tls_provider = tls_registry.get(tls_provider_name).ok_or(anyhow::anyhow!(
+                "TLS provider '{tls_provider_name}' not found ({})",
+                format_location(None, tls1.span.as_ref())
+            ))?;
+
+            let mut tls_resolver_ctx = TlsContext {
+                // SAFETY: We know that the lifetime of the config is longer
+                //         than the lifetime of the resolver. but "'static"
+                //         is the only lifetime we can use here. This
+                //         constraint is enforced by the provider registry.
+                config: unsafe {
+                    std::mem::transmute::<
+                        &ServerConfigurationBlock,
+                        &'static ServerConfigurationBlock,
+                    >(&children)
+                },
+                alpn: {
+                    let alpn_protocols = http_connection_options.alpn_protocols();
+                    (!alpn_protocols.is_empty()).then_some(alpn_protocols)
+                },
+                domain: host_config.0.clone(),
+                port: port_config.port.unwrap_or(443),
+                resolver: None,
+            };
+            tls_provider.execute(&mut tls_resolver_ctx)?;
+            let tls_resolver_sub = tls_resolver_ctx.resolver.ok_or(anyhow::anyhow!(
+                "TLS resolver '{tls_provider_name}' not found ({})",
+                format_location(None, tls1.span.as_ref())
+            ))?;
+            if http_connection_options.protocols.http3 {
+                let quic_tls_resolver = quic_tls_resolver.get_or_insert_default();
+                let tls_resolver_host = tls_resolver_sub.get_tls_config().cert_resolver.clone();
+                match (&host_config.0.host, host_config.0.ip) {
+                    (Some(host), Some(ip)) => {
+                        quic_tls_resolver
+                            .host
+                            .entry(ip)
+                            .or_insert_with(CustomSniResolver::new)
+                            .load_host_resolver(host, tls_resolver_host);
+                    }
+                    (Some(host), None) => {
+                        quic_tls_resolver
+                            .fallback
+                            .get_or_insert_with(CustomSniResolver::new)
+                            .load_host_resolver(host, tls_resolver_host);
+                    }
+                    (None, Some(ip)) => {
+                        quic_tls_resolver
+                            .host
+                            .entry(ip)
+                            .or_insert_with(CustomSniResolver::new)
+                            .load_fallback_resolver(tls_resolver_host);
+                    }
+                    (None, None) => {
+                        quic_tls_resolver
+                            .fallback
+                            .get_or_insert_with(CustomSniResolver::new)
+                            .load_fallback_resolver(tls_resolver_host);
+                    }
+                }
+            }
+
+            match (&host_config.0.host, host_config.0.ip) {
+                (Some(host), Some(ip)) => {
+                    tls_resolver.insert_ip_and_hostname(ip, host, tls_resolver_sub);
+                }
+                (Some(host), None) => {
+                    tls_resolver.insert_hostname(host, tls_resolver_sub);
+                }
+                (None, Some(ip)) => {
+                    tls_resolver.insert_ip(ip, tls_resolver_sub);
+                }
+                (None, None) => {
+                    tls_resolver.set_root_data(tls_resolver_sub);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn new(
+        registry: &ferron_core::registry::Registry,
+        port_config: ferron_core::config::ServerConfigurationPort,
+        global_config: Arc<ferron_core::config::ServerConfigurationBlock>,
+        port: u16,
+        https_port: Option<u16>,
+        explicit_port: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = Self::build_config(
+            registry,
+            &port_config,
+            global_config,
+            https_port,
+            explicit_port,
+        )?;
+        Ok(Self {
+            config: Arc::new(ArcSwap::new(Arc::new(config))),
+            listeners: Mutex::new(Vec::new()),
+            quic_listeners: Mutex::new(Vec::new()),
+            port,
+        })
+    }
+
+    /// Reload the module with new configuration.
+    /// This method is called during configuration reload (SIGHUP).
+    /// It atomically replaces all reloadable fields with new values.
+    pub fn reload(
+        &self,
+        registry: &ferron_core::registry::Registry,
+        port_config: ferron_core::config::ServerConfigurationPort,
+        global_config: Arc<ferron_core::config::ServerConfigurationBlock>,
+        https_port: Option<u16>,
+        explicit_port: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Cancel the old reload token to trigger graceful shutdown of existing connections
+        let old_config = self.config.load();
+
+        let new_config = Self::build_config(
+            registry,
+            &port_config,
+            global_config,
+            https_port,
+            explicit_port,
+        )?;
+        self.config.store(Arc::new(new_config));
+
+        old_config.reload_token.cancel();
+
+        Ok(())
+    }
+}
+
+impl Module for BasicHttpModule {
+    fn name(&self) -> &str {
+        "http-server"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn start(&self, runtime: &mut Runtime) -> Result<(), Box<dyn std::error::Error>> {
+        let port = if self.port != 0 { self.port } else { 80 };
+
+        let config = self.config.load();
+        let has_http3 = config.quic_tls_resolver.is_some();
+        let listener_options = resolve_tcp_listener_options(&config.global_config, port)?;
+        let listener_addresses = listener_options.address.clone();
+        let listener =
+            tcp::TcpListenerHandle::new(listener_options, has_http3, self.config.clone(), runtime)
+                .map_err(|e| anyhow::anyhow!("Failed to start HTTP server on port {port}: {e}"))?;
+        self.listeners.lock().push(listener);
+
+        if has_http3 {
+            let quic_listener =
+                quic::QuicListenerHandle::new(&listener_addresses, self.config.clone(), runtime)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to start HTTP/3 server on port {port}: {e}")
+                    })?;
+            self.quic_listeners.lock().push(quic_listener);
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for BasicHttpModule {
+    fn drop(&mut self) {
+        for listener in &*self.listeners.lock() {
+            listener.cancel();
+        }
+        for quic_listener in &*self.quic_listeners.lock() {
+            quic_listener.cancel();
+        }
+    }
+}
+
+/// Global Unix domain socket HTTP listener — one instance for the whole server
+/// (Unix only, merged hosts). See module-level docs for why this is separate
+/// from `BasicHttpModule`.
+#[cfg(unix)]
+pub struct UnixHttpModule {
+    config: ConfigArcSwap,
+    listeners: Mutex<Vec<unix::UnixListenerHandle>>,
+}
+
+#[cfg(unix)]
+impl UnixHttpModule {
+    pub fn new(
+        registry: &ferron_core::registry::Registry,
+        global_config: Arc<ServerConfigurationBlock>,
+        all_hosts: Vec<(ServerConfigurationHostFilters, ServerConfigurationBlock)>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Build a synthetic port config that merges all hosts; use port 0 sentinel
+        // and enable TLS processing (is_unix=true) so any host's TLS is registered.
+        let port_config = ferron_core::config::ServerConfigurationPort {
+            port: None,
+            hosts: all_hosts,
+        };
+        let cfg = BasicHttpModule::build_config_inner(
+            registry,
+            &port_config,
+            global_config,
+            None,
+            false,
+            true,
+        )?;
+        Ok(Self {
+            config: Arc::new(ArcSwap::new(Arc::new(cfg))),
+            listeners: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn reload(
+        &self,
+        registry: &ferron_core::registry::Registry,
+        global_config: Arc<ServerConfigurationBlock>,
+        all_hosts: Vec<(ServerConfigurationHostFilters, ServerConfigurationBlock)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let old_config = self.config.load();
+        let port_config = ferron_core::config::ServerConfigurationPort {
+            port: Some(0),
+            hosts: all_hosts,
+        };
+        let https_port = match global_config
+            .directives
+            .get("default_https_port")
+            .and_then(|e| e.first())
+            .and_then(|v| v.args.first())
+        {
+            Some(v) => {
+                if let Some(b) = v.as_boolean() {
+                    if b {
+                        Some(443)
+                    } else {
+                        None
+                    }
+                } else {
+                    v.as_number().and_then(|n| u16::try_from(n).ok())
+                }
+            }
+            None => Some(443),
+        };
+        let new_cfg = BasicHttpModule::build_config_inner(
+            registry,
+            &port_config,
+            global_config,
+            https_port,
+            false,
+            true,
+        )?;
+        self.config.store(Arc::new(new_cfg));
+        old_config.reload_token.cancel();
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Module for UnixHttpModule {
+    fn name(&self) -> &str {
+        "http-server-unix"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn start(&self, runtime: &mut Runtime) -> Result<(), Box<dyn std::error::Error>> {
+        let config = self.config.load();
+        let unix_options = unix::resolve_unix_listener_options(&config.global_config)?;
+        for opt in unix_options {
+            let path = opt.path.clone();
+            let handle = unix::UnixListenerHandle::new(opt, false, self.config.clone(), runtime)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to start HTTP server on unix:{}: {e}",
+                        path.display()
+                    )
+                })?;
+            self.listeners.lock().push(handle);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixHttpModule {
+    fn drop(&mut self) {
+        for ul in &*self.listeners.lock() {
+            ul.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferron_core::config::ServerConfigurationValue;
+    use rustc_hash::FxHashMap;
+
+    fn entry(
+        args: Vec<ServerConfigurationValue>,
+        children: Option<ServerConfigurationBlock>,
+    ) -> Vec<ServerConfigurationDirectiveEntry> {
+        vec![ServerConfigurationDirectiveEntry {
+            args,
+            children,
+            span: None,
+        }]
+    }
+
+    fn block(
+        directives: Vec<(&str, Vec<ServerConfigurationDirectiveEntry>)>,
+    ) -> ServerConfigurationBlock {
+        ServerConfigurationBlock {
+            directives: Arc::new(
+                directives
+                    .into_iter()
+                    .map(|(name, entries)| (name.to_string(), entries))
+                    .collect::<FxHashMap<String, Vec<ServerConfigurationDirectiveEntry>>>(),
+            ),
+            matchers: FxHashMap::default(),
+            span: None,
+        }
+    }
+
+    fn http_block(
+        directives: Vec<(&str, Vec<ServerConfigurationDirectiveEntry>)>,
+    ) -> ServerConfigurationBlock {
+        block(vec![("http", entry(Vec::new(), Some(block(directives))))])
+    }
+
+    fn str_value(value: &str) -> ServerConfigurationValue {
+        ServerConfigurationValue::String(value.to_string(), None)
+    }
+
+    fn num(value: i64) -> ServerConfigurationValue {
+        ServerConfigurationValue::Number(value, None)
+    }
+
+    #[test]
+    fn host_http_block_inherits_unset_directives_from_global_block() {
+        let global = http_block(vec![
+            ("timeout", entry(vec![str_value("42s")], None)),
+            ("h2_max_concurrent_streams", entry(vec![num(7)], None)),
+        ]);
+        let host = http_block(vec![("protocols", entry(vec![str_value("h1")], None))]);
+
+        let options = resolve_http_connection_options(&global, &host).unwrap();
+
+        assert_eq!(
+            options.timeout,
+            Some(std::time::Duration::from_secs(42)),
+            "host block must inherit `timeout` from the global block"
+        );
+        assert_eq!(
+            options.h2.max_concurrent_streams,
+            Some(7),
+            "host block must inherit `h2_max_concurrent_streams` from the global block"
+        );
+        assert!(
+            options.protocols.http1 && !options.protocols.http2,
+            "host block must override `protocols`, got {:?}",
+            options.protocols
+        );
+    }
+
+    #[test]
+    fn host_http_block_overrides_directives_it_sets() {
+        let global = http_block(vec![("timeout", entry(vec![str_value("42s")], None))]);
+        let host = http_block(vec![("timeout", entry(vec![str_value("5s")], None))]);
+
+        let options = resolve_http_connection_options(&global, &host).unwrap();
+
+        assert_eq!(options.timeout, Some(std::time::Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn host_without_http_block_uses_global_block() {
+        let global = http_block(vec![("protocols", entry(vec![str_value("h2")], None))]);
+        let host = block(vec![("root", entry(vec![str_value("/srv")], None))]);
+
+        let options = resolve_http_connection_options(&global, &host).unwrap();
+
+        assert!(
+            options.protocols.http2 && !options.protocols.http1,
+            "expected the global `protocols` to apply, got {:?}",
+            options.protocols
+        );
+    }
+
+    #[test]
+    fn h2_max_frame_size_outside_protocol_range_is_rejected() {
+        for size in ["1", "16383", "16777216"] {
+            let block = http_block(vec![(
+                "h2_max_frame_size",
+                entry(vec![num(size.parse().unwrap())], None),
+            )]);
+            let err = resolve_http_connection_options(&block, &block).unwrap_err();
+            assert!(
+                err.to_string().contains("between 16384 and 16777215"),
+                "unexpected error for h2_max_frame_size {size}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn h2_max_frame_size_inside_protocol_range_is_accepted() {
+        for size in ["16384", "65536", "16777215"] {
+            let block = http_block(vec![(
+                "h2_max_frame_size",
+                entry(vec![num(size.parse().unwrap())], None),
+            )]);
+            let options = resolve_http_connection_options(&block, &block).unwrap();
+            assert_eq!(options.h2.max_frame_size, Some(size.parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn h2_initial_window_size_above_protocol_maximum_is_rejected() {
+        let block = http_block(vec![(
+            "h2_initial_window_size",
+            entry(vec![num(1_i64 << 31)], None),
+        )]);
+        let err = resolve_http_connection_options(&block, &block).unwrap_err();
+        assert!(
+            err.to_string().contains("between 0 and 2147483647"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn connection_options_without_any_http_block_use_defaults() {
+        let host = block(vec![("root", entry(vec![str_value("/srv")], None))]);
+
+        let options = resolve_http_connection_options(&host, &host).unwrap();
+
+        assert_eq!(options.timeout, Some(std::time::Duration::from_secs(300)));
+        assert!(options.protocols.http1 && options.protocols.http2);
+    }
+}

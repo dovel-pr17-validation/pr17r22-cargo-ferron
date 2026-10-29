@@ -1,0 +1,46 @@
+//! Session affinity (sticky session) implementation.
+
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+use rustc_hash::FxHashSet;
+
+use crate::types::upstream::ResolvedUpstream;
+use crate::upstream::lb::ConsistentHashRing;
+
+/// Resolve an affinity key to a backend index.
+///
+/// For cookie and header affinity, the key is a backend identifier
+/// (hash of the upstream URL). For IP and hash affinity, the key
+/// is used directly with the consistent hash ring.
+#[inline]
+pub fn resolve_affinity_index(
+    affinity_type: &crate::types::affinity::AffinityType,
+    affinity_key: &[u8],
+    backends: &[Arc<ResolvedUpstream>],
+    excluded_backend_indexes: &FxHashSet<usize>,
+    ring: &RwLock<ConsistentHashRing>,
+) -> Option<usize> {
+    if backends.is_empty() {
+        return None;
+    }
+
+    match affinity_type {
+        crate::types::affinity::AffinityType::Cookie(_)
+        | crate::types::affinity::AffinityType::Header(_)
+        | crate::types::affinity::AffinityType::Ip
+        | crate::types::affinity::AffinityType::Hash { .. } => {
+            let mut guard = ring.read();
+            if guard.needs_rebuild(backends) {
+                drop(guard);
+                let mut guard_w = ring.write();
+                if guard_w.needs_rebuild(backends) {
+                    guard_w.rebuild(backends);
+                }
+                drop(guard_w);
+                guard = ring.read();
+            }
+            guard.get(affinity_key, excluded_backend_indexes)
+        }
+    }
+}

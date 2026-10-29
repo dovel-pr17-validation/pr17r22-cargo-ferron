@@ -1,0 +1,223 @@
+//! Strict DNS (A/AAAA) resolution for upstream discovery.
+//!
+//! Resolves A and AAAA records for a hostname using Hickory, treating each
+//! resolved IP as a distinct upstream backend. CNAME chains are followed
+//! automatically by the resolver.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use crate::types::upstream::{DnsResolutionStatus, ResolvedUpstream, StaticUpstream};
+
+/// Resolve A/AAAA records for the hostname in `StaticUpstream`.
+///
+/// Returns one `ResolvedUpstream` per resolved IP address. The hostname and
+/// port are extracted from `cfg.url`.
+///
+/// Results are cached based on the minimum TTL from the DNS response.
+#[inline]
+pub async fn resolve_strict_dns(cfg: StaticUpstream) -> Vec<Arc<ResolvedUpstream>> {
+    let (hostname, port) = match parse_host_port(&cfg.url) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+
+    if let Some(cached) = super::dns_cache::get_strict_dns(&hostname, port, &cfg.dns_servers).await
+    {
+        if cached.is_empty() {
+            if let Some((_, event_sink)) = crate::runtime_handle::try_get_secondary_runtime_handle()
+            {
+                // Log a warning if no upstreams were resolved
+                event_sink.emit(ferron_observability::Event::Log(
+                    ferron_observability::LogEvent {
+                        level: ferron_observability::LogLevel::Debug,
+                        message: format!("No A/AAAA records for {}", hostname),
+                        summary: "No A/AAAA records".into(),
+                        target: crate::LOG_TARGET,
+                        attributes: vec![(
+                            "dns.name",
+                            ferron_observability::LogAttributeValue::String(hostname.clone()),
+                        )],
+                        trace_context: None,
+                    },
+                ));
+            }
+        }
+
+        return cached;
+    }
+
+    let (handle, event_sink) = match crate::runtime_handle::try_get_secondary_runtime_handle() {
+        Some(h) => h,
+        None => {
+            ferron_core::log_warn!(
+                "Strict DNS resolution skipped — secondary runtime not yet available"
+            );
+            return Vec::new();
+        }
+    };
+
+    let url = cfg.url.clone();
+    let dns_servers = cfg.dns_servers.clone();
+    let inner = cfg.inner.clone();
+
+    let result = handle
+        .spawn(async move {
+            let resolver = match crate::runtime_handle::get_or_create_resolver(&dns_servers) {
+                Some(r) => r,
+                None => {
+                    event_sink.emit(ferron_observability::Event::Log(
+                        ferron_observability::LogEvent {
+                            level: ferron_observability::LogLevel::Warn,
+                            message: "Failed to create DNS resolver for strict DNS".to_string(),
+                            summary: "Failed to create DNS resolver".into(),
+                            target: crate::LOG_TARGET,
+                            attributes: Vec::new(),
+                            trace_context: None,
+                        },
+                    ));
+                    return Vec::new();
+                }
+            };
+
+            let mut upstreams = Vec::new();
+
+            // Resolve A and AAAA records using lookup_ip
+            match resolver.lookup_ip(hostname.clone()).await {
+                Ok(lookup) => {
+                    let ttl = lookup
+                        .valid_until()
+                        .saturating_duration_since(std::time::Instant::now());
+                    for ip in lookup.iter() {
+                        let scheme = if url.starts_with("https://") {
+                            "https"
+                        } else {
+                            "http"
+                        };
+                        let path = {
+                            let mut split = url.split("/");
+                            if split.next().is_some_and(|s| s.ends_with(':')) {
+                                split.next();
+                                split.next();
+                            }
+                            split.fold(String::new(), |mut s, j| {
+                                s.push('/');
+                                s.push_str(j);
+                                s
+                            })
+                        };
+                        let proxy_to = format!("{}://{}:{}{}", scheme, hostname, port, path);
+                        upstreams.push(Arc::new(ResolvedUpstream {
+                            proxy_to,
+                            connect_to: Some(SocketAddr::new(ip, port)),
+                            proxy_unix: None,
+                            inner: inner.clone(),
+                            dns_status: DnsResolutionStatus::Resolved,
+                        }));
+                    }
+
+                    if upstreams.is_empty() {
+                        // Log a warning if no upstreams were resolved
+                        event_sink.emit(ferron_observability::Event::Log(
+                            ferron_observability::LogEvent {
+                                level: ferron_observability::LogLevel::Debug,
+                                message: format!("No A/AAAA records for {}", hostname),
+                                summary: "No A/AAAA records".into(),
+                                target: crate::LOG_TARGET,
+                                attributes: vec![(
+                                    "dns.name",
+                                    ferron_observability::LogAttributeValue::String(
+                                        hostname.clone(),
+                                    ),
+                                )],
+                                trace_context: None,
+                            },
+                        ));
+                    }
+
+                    upstreams.sort_unstable_by(|a, b| {
+                        (&a.proxy_to, &a.proxy_unix, &a.connect_to).cmp(&(
+                            &b.proxy_to,
+                            &b.proxy_unix,
+                            &b.connect_to,
+                        ))
+                    });
+
+                    // Store the upstreams in the cache
+                    super::dns_cache::insert_strict_dns(
+                        &hostname,
+                        port,
+                        &dns_servers,
+                        upstreams.clone(),
+                        ttl,
+                    );
+                }
+                Err(e) => {
+                    // NXDOMAIN or no records, not necessarily an error...
+                    event_sink.emit(ferron_observability::Event::Log(
+                        ferron_observability::LogEvent {
+                            level: ferron_observability::LogLevel::Debug,
+                            message: format!("No A/AAAA records for {}: {}", hostname, e),
+                            summary: "No A/AAAA records".into(),
+                            target: crate::LOG_TARGET,
+                            attributes: vec![
+                                (
+                                    "dns.name",
+                                    ferron_observability::LogAttributeValue::String(hostname),
+                                ),
+                                (
+                                    "error.message",
+                                    ferron_observability::LogAttributeValue::String(e.to_string()),
+                                ),
+                            ],
+                            trace_context: None,
+                        },
+                    ));
+                }
+            }
+
+            upstreams
+        })
+        .await;
+
+    result.unwrap_or_default()
+}
+
+/// Extract hostname and port from a URL string.
+///
+/// Returns `(hostname, port)` or `None` if parsing fails.
+#[inline]
+pub fn parse_host_port(url: &str) -> Option<(String, u16)> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let rest = rest.split_once('/').map_or(rest, |(r, _)| r);
+
+    let default_port = if url.starts_with("https://") { 443 } else { 80 };
+
+    // Handle IPv6 brackets: [::1]:8080
+    if rest.starts_with('[') {
+        let close = rest.find(']')?;
+        let ipv6 = &rest[1..close];
+        let after = &rest[close + 1..];
+        let port = if let Some(stripped) = after.strip_prefix(':') {
+            stripped.parse().ok()?
+        } else {
+            default_port
+        };
+        return Some((ipv6.to_string(), port));
+    }
+
+    let (host, port_str) = match rest.rfind(':') {
+        Some(pos) => (&rest[..pos], &rest[pos + 1..]),
+        None => (rest, ""),
+    };
+
+    let port = if port_str.is_empty() {
+        default_port
+    } else {
+        port_str.parse().ok()?
+    };
+
+    Some((host.to_string(), port))
+}

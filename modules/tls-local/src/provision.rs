@@ -1,0 +1,247 @@
+use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use ferron_observability::CompositeEventSink;
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, IsCa, KeyIdMethod, KeyPair, SanType,
+};
+use rustls::sign::CertifiedKey;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use time::{Duration, OffsetDateTime};
+
+use crate::cache::LocalTlsCache;
+use ferron_core::config::ServerConfigurationHostFilters;
+
+const SECONDS_BEFORE_RENEWAL: u64 = 86400; // 1 day before expiration
+
+/// Checks if a TLS certificate is still valid (not needing renewal).
+pub fn check_certificate_validity(
+    certificate: &CertificateDer,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let x509_certificate = rasn::der::decode::<rasn_pkix::Certificate>(certificate)?;
+    let validity = &x509_certificate.tbs_certificate.validity;
+    let time_to_expiration_delta = match &validity.not_after {
+        rasn_pkix::Time::Utc(t) => {
+            t.signed_duration_since(chrono::DateTime::<chrono::Utc>::from(SystemTime::now()))
+        }
+        rasn_pkix::Time::General(t) => {
+            t.signed_duration_since(chrono::DateTime::<chrono::Utc>::from(SystemTime::now()))
+        }
+    };
+    if let Ok(time_to_expiration) = time_to_expiration_delta.to_std() {
+        let valid_duration_delta = match (&validity.not_before, &validity.not_after) {
+            (rasn_pkix::Time::Utc(b), rasn_pkix::Time::Utc(a)) => a.signed_duration_since(b),
+            (rasn_pkix::Time::Utc(b), rasn_pkix::Time::General(a)) => a.signed_duration_since(b),
+            (rasn_pkix::Time::General(b), rasn_pkix::Time::Utc(a)) => a.signed_duration_since(b),
+            (rasn_pkix::Time::General(b), rasn_pkix::Time::General(a)) => {
+                a.signed_duration_since(b)
+            }
+        };
+        let time_before_expiration = if let Ok(valid_duration) = valid_duration_delta.to_std() {
+            (valid_duration.as_secs() / 2).min(SECONDS_BEFORE_RENEWAL)
+        } else {
+            SECONDS_BEFORE_RENEWAL
+        };
+        if time_to_expiration >= std::time::Duration::from_secs(time_before_expiration) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn emit_cert_metric(
+    event_sink: Option<&Arc<CompositeEventSink>>,
+    host: &str,
+    certified_key: &CertifiedKey,
+) {
+    if let (Some(sink), Some(leaf)) = (event_sink, certified_key.cert.first()) {
+        ferron_tls::observability::emit_certificate_not_after(sink, "local", host, leaf);
+    }
+}
+
+pub fn provision_local_cert(
+    cache: &LocalTlsCache,
+    filters: &ServerConfigurationHostFilters,
+    event_sink: Option<&Arc<CompositeEventSink>>,
+) -> Result<Arc<CertifiedKey>, Box<dyn std::error::Error>> {
+    let host = filters
+        .host
+        .clone()
+        .or_else(|| filters.ip.map(|i| i.to_canonical().to_string()))
+        .unwrap_or_default();
+
+    // Normalize and hash the SAN set
+    let san_set = normalize_san_set(filters);
+    let san_hash = compute_san_hash(&san_set);
+
+    // Try to load cached leaf cert
+    if let (Some(cert_pem), Some(key_pem)) = (
+        cache.get_leaf_cert(&san_hash),
+        cache.get_leaf_key(&san_hash),
+    ) {
+        if let Ok(certified_key) = parse_certified_key(&cert_pem, &key_pem) {
+            // Check if certificate is still valid
+            if certified_key
+                .cert
+                .first()
+                .and_then(|c| check_certificate_validity(c).ok())
+                .unwrap_or(false)
+            {
+                emit_cert_metric(event_sink, &host, &certified_key);
+                return Ok(Arc::new(certified_key));
+            }
+        }
+    }
+
+    // Need to generate/load CA
+    let (ca_params, ca_key_pair) = get_or_generate_ca(cache)
+        .map_err(|e| anyhow::anyhow!("CA certificate generation failed: {e}"))?;
+    ferron_core::log_info!(
+        "Local CA certificate can be found in \"{}\". Import the CA certificate into your \
+    system trust store to trust the generated certificates.",
+        cache.ca_path().display()
+    );
+
+    Ok(generate_leaf_cert(
+        cache,
+        ca_params,
+        ca_key_pair,
+        san_set,
+        san_hash,
+        event_sink,
+        &host,
+    )
+    .map_err(|e| anyhow::anyhow!("Leaf certificate generation failed: {e}"))?)
+}
+
+fn generate_leaf_cert(
+    cache: &LocalTlsCache,
+    ca_params: CertificateParams,
+    ca_key_pair: KeyPair,
+    san_set: BTreeSet<String>,
+    san_hash: String,
+    event_sink: Option<&Arc<CompositeEventSink>>,
+    host: &str,
+) -> Result<Arc<CertifiedKey>, Box<dyn std::error::Error>> {
+    // Generate leaf cert
+    let mut leaf_cert_params = CertificateParams::default();
+    leaf_cert_params.not_before = OffsetDateTime::now_utc().saturating_sub(Duration::days(1));
+    leaf_cert_params.not_after = OffsetDateTime::now_utc().saturating_add(Duration::days(365));
+    leaf_cert_params.distinguished_name = DistinguishedName::new();
+    leaf_cert_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferron Local TLS");
+    leaf_cert_params.subject_alt_names = Vec::new();
+    for san in san_set {
+        leaf_cert_params
+            .subject_alt_names
+            .push(if let Ok(ip) = san.parse::<IpAddr>() {
+                SanType::IpAddress(ip)
+            } else {
+                SanType::DnsName(san.try_into().map_err(|_| "Invalid SAN entry")?)
+            });
+    }
+    leaf_cert_params.is_ca = IsCa::NoCa;
+
+    let leaf_key_pair = KeyPair::generate()?;
+    let issuer = rcgen::Issuer::from_params(&ca_params, ca_key_pair);
+    let leaf_cert = leaf_cert_params.signed_by(&leaf_key_pair, &issuer)?;
+    let cert_pem = leaf_cert.pem();
+    let key_pem = leaf_key_pair.serialize_pem();
+
+    // Cache the leaf cert
+    if let Err(e) = cache.save_leaf(&san_hash, &cert_pem, &key_pem) {
+        ferron_core::log_warn!(
+            "Failed to save leaf certificate and key to cache \
+            (they will be regenerated on restart): {e}"
+        );
+    }
+
+    let certified_key = parse_certified_key(&cert_pem, &key_pem)?;
+    emit_cert_metric(event_sink, host, &certified_key);
+    Ok(Arc::new(certified_key))
+}
+
+fn normalize_san_set(filters: &ServerConfigurationHostFilters) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    if let Some(ref host) = filters.host {
+        set.insert(host.clone());
+    }
+    if let Some(ref ip) = filters.ip {
+        set.insert(ip.to_string());
+    }
+
+    // If it's localhost, also add 127.0.0.1 and ::1 for convenience
+    if set.contains("localhost") || set.contains("127.0.0.1") || set.contains("::1") {
+        set.insert("localhost".to_string());
+        set.insert("127.0.0.1".to_string());
+        set.insert("::1".to_string());
+    }
+
+    set
+}
+
+fn compute_san_hash(set: &BTreeSet<String>) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for san in set {
+        san.hash(&mut hasher);
+    }
+    format!("{:x}", hasher.finish())
+}
+
+fn get_or_generate_ca(
+    cache: &LocalTlsCache,
+) -> Result<(CertificateParams, KeyPair), Box<dyn std::error::Error>> {
+    if let (Some(_cert_pem), Some(key_pem)) = (cache.get_ca_cert(), cache.get_ca_key()) {
+        let key_pair = KeyPair::from_pem(&key_pem)?;
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Ferron Local Root CA");
+        params.key_identifier_method = KeyIdMethod::Sha256;
+        return Ok((params, key_pair));
+    }
+
+    // Generate new CA
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferron Local Root CA");
+    params.not_before = OffsetDateTime::now_utc().saturating_sub(Duration::days(1));
+    params.not_after = OffsetDateTime::now_utc().saturating_add(Duration::days(3650)); // 10 years
+    params.key_identifier_method = KeyIdMethod::Sha256;
+
+    let key_pair = KeyPair::generate()?;
+    let ca_cert = params.clone().self_signed(&key_pair)?;
+    let cert_pem = ca_cert.pem();
+    let key_pem = key_pair.serialize_pem();
+
+    if let Err(e) = cache.save_ca(&cert_pem, &key_pem) {
+        ferron_core::log_warn!(
+            "Failed to save CA certificate and key to cache \
+            (they will be regenerated on restart): {e}"
+        );
+    }
+
+    Ok((params, key_pair))
+}
+
+fn parse_certified_key(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<CertifiedKey, Box<dyn std::error::Error>> {
+    let cert_chain =
+        CertificateDer::pem_reader_iter(&mut cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+    let private_key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
+
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&private_key)?;
+    Ok(CertifiedKey::new(cert_chain, signing_key))
+}

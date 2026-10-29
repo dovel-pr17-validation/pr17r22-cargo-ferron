@@ -1,0 +1,35 @@
+[package]
+name = "ferron-http-fproxy"
+version = "3.0.0-rc.10"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+zincio = { version = "0.2.22", default-features = false, features = ["time"] }
+zincio-hyper = { version = "0.2.22" }
+zincio-http = { version = "0.4.2", default-features = false, features = ["h1"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+ferron-core = { path = "../../core" }
+ferron-http = { path = "../../types/http" }
+ferron-observability = { path = "../../types/observability" }
+tokio = { version = "1", features = [
+    "rt",
+    "io-util",
+    "sync",
+    "macros",
+    "time",
+    "net",
+] }
+ipnet = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Networking_WinSock"] }
+
+[lints]
+workspace = true

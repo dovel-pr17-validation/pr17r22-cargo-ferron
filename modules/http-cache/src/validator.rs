@@ -1,0 +1,613 @@
+use cidr::IpCidr;
+use ferron_core::config::parse_duration;
+use ferron_core::config::validator::{
+    entry_span, ConfigurationValidationError, ConfigurationValidator,
+};
+use ferron_core::config::{
+    ServerConfigurationBlock, ServerConfigurationDirectiveEntry, ServerConfigurationValue,
+};
+use http::header::HeaderName;
+
+use crate::config::MIN_PERSIST_INTERVAL;
+
+const GLOBAL_CACHE_DIRECTIVES: &[&str] = &["max_entries", "zone"];
+const HOST_CACHE_DIRECTIVES: &[&str] = &[
+    "max_response_size",
+    "litespeed_override_cache_control",
+    "emit_litespeed_headers",
+    "purge_method",
+    "purge_allowed_ips",
+    "purge_propagation",
+    "vary",
+    "vary_cookies",
+    "ignore",
+    "ignore_request_cache_control",
+    "enable_stale_while_revalidate",
+    "enable_stale_if_error",
+    "coalesce_timeout",
+    "zone",
+    "max_entries",
+    "persist",
+    "persist_interval",
+    "persist_private",
+];
+
+#[derive(Default)]
+pub struct HttpCacheConfigurationValidator;
+
+impl ConfigurationValidator for HttpCacheConfigurationValidator {
+    #[inline]
+    fn validate_block(
+        &self,
+        config: &ServerConfigurationBlock,
+        ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        let is_global = ctx.is_global;
+        let used_directives = &mut ctx.used_directives;
+        if is_global {
+            if let Some(entries) = config.directives.get("cache") {
+                used_directives.insert("cache".to_string());
+                for entry in entries {
+                    if !entry.args.is_empty() {
+                        return Err(ConfigurationValidationError::from(
+                            "Invalid `cache` - global cache configuration only supports block form",
+                        )
+                        .with_span(entry_span(entry)));
+                    }
+
+                    let Some(children) = &entry.children else {
+                        return Err(ConfigurationValidationError::from(
+                            "Invalid `cache` - global cache configuration requires a block",
+                        )
+                        .with_span(entry_span(entry)));
+                    };
+
+                    validate_cache_block(
+                        children,
+                        ctx,
+                        &[HOST_CACHE_DIRECTIVES, GLOBAL_CACHE_DIRECTIVES].concat(),
+                        false,
+                        true,
+                    )?;
+                    if !children.directives.contains_key("max_entries") {
+                        return Err(ConfigurationValidationError::from(
+                            "Invalid `cache` - global cache configuration requires `max_entries`",
+                        )
+                        .with_span(children.span.clone()));
+                    }
+
+                    if let Some(nested_entries) = children.directives.get("max_entries") {
+                        for nested_entry in nested_entries {
+                            validate_single_non_negative_integer(nested_entry, "max_entries")?;
+                        }
+                    }
+
+                    if let Some(zone_entries) = children.directives.get("zone") {
+                        for zone_entry in zone_entries {
+                            validate_global_zone_block(zone_entry, ctx)?;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if let Some(entries) = config.directives.get("cache") {
+            used_directives.insert("cache".to_string());
+            for entry in entries {
+                if let Some(children) = &entry.children {
+                    if !entry.args.is_empty() {
+                        return Err(ConfigurationValidationError::from(
+                            "Invalid `cache` - block form does not accept boolean arguments",
+                        )
+                        .with_span(entry_span(entry)));
+                    }
+
+                    validate_cache_block(
+                        children,
+                        ctx,
+                        HOST_CACHE_DIRECTIVES,
+                        config.directives.contains_key("basic_auth"),
+                        false,
+                    )?;
+                } else {
+                    if entry.args.len() > 1 {
+                        return Err(ConfigurationValidationError::from(
+                            "Invalid `cache` - expected at most one boolean argument",
+                        )
+                        .with_span(entry_span(entry)));
+                    }
+                    if let Some(value) = entry.args.first() {
+                        if value.as_boolean().is_none() {
+                            return Err(ConfigurationValidationError::from(
+                                "Invalid `cache` - expected a boolean value",
+                            )
+                            .with_span(entry_span(entry)));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_cache_block(
+    block: &ServerConfigurationBlock,
+    ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    allowed_directives: &[&str],
+    parent_has_basic_auth: bool,
+    is_global: bool,
+) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+    let mut sub = std::collections::HashSet::new();
+
+    for allowed in allowed_directives {
+        if let Some(entries) = block.directives.get(*allowed) {
+            sub.insert(allowed.to_string());
+            if *allowed == "purge_propagation" || *allowed == "zone" {
+                continue;
+            }
+            for entry in entries {
+                if entry.children.is_some() {
+                    return Err(ConfigurationValidationError::from(format!(
+                        "Invalid `{allowed}` - nested blocks are not supported"
+                    ))
+                    .with_span(entry_span(entry)));
+                }
+            }
+        }
+    }
+
+    ferron_core::check_unused_subdirectives!(block, sub, &mut ctx.diagnostics, ctx.scope.clone());
+
+    if let Some(entries) = block.directives.get("max_entries") {
+        for entry in entries {
+            validate_single_non_negative_integer(entry, "max_entries")?;
+        }
+    }
+
+    if let Some(entries) = block.directives.get("max_response_size") {
+        for entry in entries {
+            validate_single_non_negative_integer(entry, "max_response_size")?;
+        }
+    }
+
+    if let Some(entries) = block.directives.get("coalesce_timeout") {
+        for entry in entries {
+            validate_single_non_negative_integer(entry, "coalesce_timeout")?;
+        }
+    }
+
+    if let Some(entries) = block.directives.get("litespeed_override_cache_control") {
+        for entry in entries {
+            validate_boolean_entry(entry, "litespeed_override_cache_control")?;
+            if entry.get_flag() {
+                ctx.add_best_practice_violation(
+                    "`litespeed_override_cache_control` makes LiteSpeed cache headers override standard HTTP cache policy; enable it only for applications that require LiteSpeed-compatible semantics",
+                    entry_span(entry),
+                );
+            }
+        }
+    }
+
+    if let Some(entries) = block.directives.get("ignore_request_cache_control") {
+        for entry in entries {
+            validate_boolean_entry(entry, "ignore_request_cache_control")?;
+            if entry.get_flag() {
+                ctx.add_best_practice_violation(
+                    "`ignore_request_cache_control` is enabled - cache policy will be ignored based on request headers",
+                    entry_span(entry),
+                );
+            }
+        }
+    }
+
+    if let Some(entries) = block.directives.get("emit_litespeed_headers") {
+        for entry in entries {
+            validate_boolean_entry(entry, "emit_litespeed_headers")?;
+        }
+    }
+
+    if let Some(entries) = block.directives.get("purge_method") {
+        for entry in entries {
+            validate_boolean_entry(entry, "purge_method")?;
+            if entry.get_flag()
+                && !parent_has_basic_auth
+                && !block.directives.contains_key("purge_allowed_ips")
+            {
+                ctx.add_best_practice_violation(
+                    "`purge_method` is enabled without `purge_allowed_ips` or a `basic_auth` block in the same scope; add an explicit purge access control before relying on cache purging",
+                    entry_span(entry),
+                );
+            }
+        }
+    }
+
+    if let Some(entries) = block.directives.get("purge_allowed_ips") {
+        validate_cidr_list(entries, "purge_allowed_ips")?;
+        for entry in entries {
+            for arg in &entry.args {
+                if arg
+                    .as_str()
+                    .is_some_and(|value| value == "0.0.0.0/0" || value == "::/0")
+                {
+                    ctx.add_best_practice_violation(
+                        "`purge_allowed_ips` allows every source address; restrict cache purging to trusted operators or internal networks",
+                        entry_span(entry),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(entries) = block.directives.get("vary") {
+        validate_header_name_list(entries, "vary")?;
+    }
+
+    if let Some(entries) = block.directives.get("ignore") {
+        validate_header_name_list(entries, "ignore")?;
+    }
+
+    if let Some(entries) = block.directives.get("purge_propagation") {
+        for entry in entries {
+            if let Some(children) = &entry.children {
+                validate_purge_propagation_block(children, ctx)?;
+            } else {
+                return Err(ConfigurationValidationError::from(
+                    "Invalid `purge_propagation` - expected a block with nested directives",
+                )
+                .with_span(entry_span(entry)));
+            }
+        }
+    }
+
+    if let Some(entries) = block.directives.get("zone") {
+        for entry in entries {
+            if !is_global && entry.children.is_some() {
+                return Err(ConfigurationValidationError::from(
+                    "Invalid `zone` - expected a string argument, not a block",
+                )
+                .with_span(entry_span(entry)));
+            }
+            if entry.args.len() != 1 {
+                return Err(ConfigurationValidationError::from(
+                    "Invalid `zone` - expected exactly one string argument (the zone name)",
+                )
+                .with_span(entry_span(entry)));
+            }
+            if entry.args.first().and_then(|v| v.as_str()).is_none() {
+                return Err(ConfigurationValidationError::from(
+                    "Invalid `zone` - expected a string value",
+                )
+                .with_span(entry_span(entry)));
+            }
+        }
+    }
+
+    if let Some(entries) = block.directives.get("persist") {
+        for entry in entries {
+            validate_persist_dir(entry)?;
+        }
+    }
+
+    if let Some(entries) = block.directives.get("persist_interval") {
+        for entry in entries {
+            validate_persist_interval(entry)?;
+        }
+    }
+
+    if let Some(entries) = block.directives.get("persist_private") {
+        for entry in entries {
+            validate_boolean_entry(entry, "persist_private")?;
+            if entry.get_flag() {
+                ctx.add_best_practice_violation(
+                    "`persist_private` writes private cache entries to disk; make sure the persistence directory is protected and required by your privacy policy",
+                    entry_span(entry),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+const PURGE_PROPAGATION_DIRECTIVES: &[&str] = &["control_plane_url", "shared_secret", "node_id"];
+
+fn validate_purge_propagation_block(
+    block: &ServerConfigurationBlock,
+    ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+    let mut sub = std::collections::HashSet::new();
+
+    for allowed in PURGE_PROPAGATION_DIRECTIVES {
+        if let Some(entries) = block.directives.get(*allowed) {
+            sub.insert(allowed.to_string());
+            for entry in entries {
+                if entry.children.is_some() {
+                    return Err(ConfigurationValidationError::from(format!(
+                        "Invalid `{allowed}` - nested blocks are not supported"
+                    ))
+                    .with_span(entry_span(entry)));
+                }
+                if entry.args.len() != 1 {
+                    return Err(ConfigurationValidationError::from(format!(
+                        "Invalid `{allowed}` - expected exactly one string argument"
+                    ))
+                    .with_span(entry_span(entry)));
+                }
+                if entry.args.first().and_then(|v| v.as_str()).is_none() {
+                    return Err(ConfigurationValidationError::from(format!(
+                        "Invalid `{allowed}` - expected a string value"
+                    ))
+                    .with_span(entry_span(entry)));
+                }
+            }
+        }
+    }
+
+    ferron_core::check_unused_subdirectives!(block, sub, &mut ctx.diagnostics, ctx.scope.clone());
+
+    if let Some(entries) = block.directives.get("control_plane_url") {
+        for entry in entries {
+            if let Some(url) = entry.args.first().and_then(|v| v.as_str()) {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    ctx.add_best_practice_violation(
+                        "`control_plane_url` should use HTTPS in production environments",
+                        entry_span(entry),
+                    );
+                }
+            }
+        }
+    }
+
+    if block.directives.contains_key("control_plane_url")
+        && !block.directives.contains_key("shared_secret")
+    {
+        ctx.add_best_practice_violation(
+            "`purge_propagation` has `control_plane_url` but no `shared_secret`; add a shared secret to authenticate purge webhooks",
+            None,
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_boolean_entry(
+    entry: &ServerConfigurationDirectiveEntry,
+    name: &str,
+) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+    if entry.args.len() > 1 {
+        return Err(ConfigurationValidationError::from(format!(
+            "Invalid `{name}` - expected at most one boolean argument"
+        ))
+        .with_span(entry_span(entry)));
+    }
+    if let Some(value) = entry.args.first() {
+        if value.as_boolean().is_none() {
+            return Err(ConfigurationValidationError::from(format!(
+                "Invalid `{name}` - expected a boolean value"
+            ))
+            .with_span(entry_span(entry)));
+        }
+    }
+    Ok(())
+}
+
+fn validate_persist_dir(
+    entry: &ServerConfigurationDirectiveEntry,
+) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+    if entry.args.len() != 1 {
+        return Err(ConfigurationValidationError::from(
+            "Invalid `persist` - expected exactly one string argument (the directory path)",
+        )
+        .with_span(entry_span(entry)));
+    }
+    if entry.args.first().and_then(|v| v.as_str()).is_none() {
+        return Err(ConfigurationValidationError::from(
+            "Invalid `persist` - expected a string value",
+        )
+        .with_span(entry_span(entry)));
+    }
+    Ok(())
+}
+
+fn validate_persist_interval(
+    entry: &ServerConfigurationDirectiveEntry,
+) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+    if entry.args.len() != 1 {
+        return Err(ConfigurationValidationError::from(
+            "Invalid `persist_interval` - expected exactly one duration argument",
+        )
+        .with_span(entry_span(entry)));
+    }
+    let value = entry.args.first().and_then(|v| v.as_str()).ok_or_else(|| {
+        ConfigurationValidationError::from(
+            "Invalid `persist_interval` - expected a duration string",
+        )
+        .with_span(entry_span(entry))
+    })?;
+    let duration = parse_duration(value).map_err(|parse_err| {
+        ConfigurationValidationError::from(format!(
+            "Invalid `persist_interval` duration: {parse_err}"
+        ))
+        .with_span(entry_span(entry))
+    })?;
+    if duration < MIN_PERSIST_INTERVAL {
+        return Err(ConfigurationValidationError::from(format!(
+            "Invalid `persist_interval` - minimum is {} second(s)",
+            MIN_PERSIST_INTERVAL.as_secs()
+        ))
+        .with_span(entry_span(entry)));
+    }
+    Ok(())
+}
+
+fn validate_single_non_negative_integer(
+    entry: &ServerConfigurationDirectiveEntry,
+    name: &str,
+) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+    if entry.args.len() != 1 {
+        return Err(ConfigurationValidationError::from(format!(
+            "Invalid `{name}` - expected exactly one integer argument"
+        ))
+        .with_span(entry_span(entry)));
+    }
+    let value = entry
+        .args
+        .first()
+        .and_then(ServerConfigurationValue::as_number)
+        .ok_or_else(|| {
+            ConfigurationValidationError::from(format!(
+                "Invalid `{name}` - expected an integer value"
+            ))
+            .with_span(entry_span(entry))
+        })?;
+    if value < 0 {
+        return Err(ConfigurationValidationError::from(format!(
+            "Invalid `{name}` - expected a non-negative integer"
+        ))
+        .with_span(entry_span(entry)));
+    }
+    Ok(())
+}
+
+fn validate_cidr_list(
+    entries: &[ServerConfigurationDirectiveEntry],
+    name: &str,
+) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+    for entry in entries {
+        if entry.args.is_empty() {
+            return Err(ConfigurationValidationError::from(format!(
+                "Invalid `{name}` - expected at least one IP or CIDR"
+            ))
+            .with_span(entry_span(entry)));
+        }
+        for arg in &entry.args {
+            let value = arg.as_str().ok_or_else(|| {
+                ConfigurationValidationError::from(format!(
+                    "Invalid `{name}` - expected string IP/CIDR values"
+                ))
+                .with_span(entry_span(entry))
+            })?;
+            value.parse::<IpCidr>().map_err(|_| {
+                ConfigurationValidationError::from(format!(
+                    "Invalid `{name}` - invalid IP or CIDR `{value}`"
+                ))
+                .with_span(entry_span(entry))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_header_name_list(
+    entries: &[ServerConfigurationDirectiveEntry],
+    name: &str,
+) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+    for entry in entries {
+        if entry.args.is_empty() {
+            return Err(ConfigurationValidationError::from(format!(
+                "Invalid `{name}` - expected at least one header name"
+            ))
+            .with_span(entry_span(entry)));
+        }
+        for arg in &entry.args {
+            let value = arg.as_str().ok_or_else(|| {
+                ConfigurationValidationError::from(format!(
+                    "Invalid `{name}` - expected string header names"
+                ))
+                .with_span(entry_span(entry))
+            })?;
+            HeaderName::from_bytes(value.trim().as_bytes()).map_err(|_| {
+                ConfigurationValidationError::from(format!(
+                    "Invalid `{name}` - invalid header name `{value}`"
+                ))
+                .with_span(entry_span(entry))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+const GLOBAL_ZONE_DIRECTIVES: &[&str] = &[
+    "max_entries",
+    "persist",
+    "persist_interval",
+    "persist_private",
+];
+
+fn validate_global_zone_block(
+    entry: &ServerConfigurationDirectiveEntry,
+    ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+    // zone must have exactly one string argument (the zone name)
+    if entry.args.len() != 1 {
+        return Err(ConfigurationValidationError::from(
+            "Invalid `zone` - expected exactly one string argument (the zone name)",
+        )
+        .with_span(entry_span(entry)));
+    }
+    if entry.args.first().and_then(|v| v.as_str()).is_none() {
+        return Err(
+            ConfigurationValidationError::from("Invalid `zone` - expected a string value")
+                .with_span(entry_span(entry)),
+        );
+    }
+
+    // zone must be a block
+    let Some(children) = &entry.children else {
+        return Err(ConfigurationValidationError::from(
+            "Invalid `zone` - expected a block with nested directives",
+        )
+        .with_span(entry_span(entry)));
+    };
+
+    let mut sub = std::collections::HashSet::new();
+    for allowed in GLOBAL_ZONE_DIRECTIVES {
+        if let Some(entries) = children.directives.get(*allowed) {
+            sub.insert(allowed.to_string());
+            for entry in entries {
+                if entry.children.is_some() {
+                    return Err(ConfigurationValidationError::from(format!(
+                        "Invalid `{allowed}` - nested blocks are not supported"
+                    ))
+                    .with_span(entry_span(entry)));
+                }
+            }
+        }
+    }
+
+    ferron_core::check_unused_subdirectives!(
+        children,
+        sub,
+        &mut ctx.diagnostics,
+        ctx.scope.clone()
+    );
+
+    if let Some(entries) = children.directives.get("max_entries") {
+        for entry in entries {
+            validate_single_non_negative_integer(entry, "max_entries")?;
+        }
+    }
+
+    if let Some(entries) = children.directives.get("persist") {
+        for entry in entries {
+            validate_persist_dir(entry)?;
+        }
+    }
+
+    if let Some(entries) = children.directives.get("persist_interval") {
+        for entry in entries {
+            validate_persist_interval(entry)?;
+        }
+    }
+
+    if let Some(entries) = children.directives.get("persist_private") {
+        for entry in entries {
+            validate_boolean_entry(entry, "persist_private")?;
+        }
+    }
+
+    Ok(())
+}

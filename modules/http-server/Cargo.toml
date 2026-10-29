@@ -1,0 +1,58 @@
+[package]
+name = "ferron-http-server"
+version = "3.0.0-rc.10"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "macros"] }
+zincio = { version = "0.2.22", default-features = false, features = ["time"] }
+zincio-http = { version = "0.4.2", default-features = false, features = [
+    "h1",
+    "h1-zerocopy",
+    "h2",
+    "h3",
+    "h3-quinn",
+] }
+zincio-quinn = { version = "0.2.22" }
+parking_lot = "0.12"
+arc-swap = "1.7"
+http = "1"
+http-body-util = "0.1.3"
+bytes = "1.11.1"
+tokio-util = "0.7.18"
+anyhow = "1.0.102"
+rustls = { version = "0.23.37", default-features = false, features = ["std"] }
+tokio-rustls = { version = "0.26.4", default-features = false }
+socket2 = "0.6.3"
+regex = "1.13.1"
+urlencoding = "2.1.3"
+ppp = "2.3.0"
+chrono = "0.4"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rustc-hash = "2"
+rand = "0.10"
+cidr = "0.3"
+quinn = { version = "0.11.8", default-features = false, features = [
+    "aws-lc-rs",
+    "rustls-aws-lc-rs",
+    "runtime-tokio",
+] }
+smallvec = "1.15.2"
+hex = "0.4.3"
+memchr = "2.8.3"
+
+ferron-core = { path = "../../core" }
+ferron-observability = { path = "../../types/observability" }
+ferron-http = { path = "../../types/http", features = ["util", "mtls"] }
+ferron-tls = { path = "../../types/tls", features = ["observability"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+fuzz = []
+fips = ["rustls/fips", "ferron-tls/fips"]
+
+[lints]
+workspace = true

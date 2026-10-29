@@ -1,0 +1,16 @@
+[package]
+name = "ferron"
+version = "3.0.0-rc.10"
+edition = "2021"
+
+[dependencies]
+ferron-entrypoint = { path = "../entrypoint", features = ["profile-default"] }
+
+[build-dependencies]
+winresource = "0.1.19"
+
+[features]
+fips = ["ferron-entrypoint/fips"]
+
+[lints]
+workspace = true

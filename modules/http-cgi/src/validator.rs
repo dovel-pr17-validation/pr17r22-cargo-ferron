@@ -1,0 +1,67 @@
+use ferron_core::config::validator::{entry_span, ConfigurationValidationError};
+use ferron_core::config::ServerConfigurationValue;
+
+pub struct CgiConfigurationValidator;
+
+impl ferron_core::config::validator::ConfigurationValidator for CgiConfigurationValidator {
+    fn validate_block(
+        &self,
+        config: &ferron_core::config::ServerConfigurationBlock,
+        ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        let used_directives = &mut ctx.used_directives;
+        ferron_core::validate_directive!(config, used_directives, cgi, optional args(1) => [ServerConfigurationValue::Boolean(_, _)], {
+            let mut sub = std::collections::HashSet::new();
+            ferron_core::validate_nested!(cgi, used(sub), extension, args(*) => [ServerConfigurationValue::String(_, _)]);
+
+            // Manual validation of `interpreter` subdirective...
+            if let Some(directives) = cgi.directives.get(stringify!(interpreter)) {
+                sub.insert(stringify!(interpreter).to_string());
+                for directive in directives {
+                    if directive.args.len() < 2 {
+                        return Err(ConfigurationValidationError::from(format!(
+                            "Invalid directive '{}': 'interpreter' subdirective requires at least two arguments",
+                            stringify!(cgi)
+                        )).with_span(entry_span(directive)));
+                    }
+
+                    let mut strings_only = true;
+                    for arg in directive.args.iter() {
+                        if !matches!(arg, ServerConfigurationValue::String(_, _)) {
+                            strings_only = false;
+                            break;
+                        }
+                    }
+                    if !strings_only {
+                        if !matches!(directive.args[0], ServerConfigurationValue::String(_, _))
+                        {
+                            return Err(ConfigurationValidationError::from(format!(
+                                "Invalid directive '{}': invalid type for '{}' subdirective at position {}",
+                                stringify!(cgi),
+                                stringify!(interpreter),
+                                0
+                            )).with_span(entry_span(directive)));
+                        }
+                        if !matches!(
+                            directive.args[1],
+                            ServerConfigurationValue::Boolean(false, _)
+                        )
+                        {
+                            return Err(ConfigurationValidationError::from(format!(
+                                "Invalid directive '{}': invalid type for '{}' subdirective at position {}",
+                                stringify!(cgi),
+                                stringify!(interpreter),
+                                1
+                            )).with_span(entry_span(directive)));
+                        };
+                    }
+                }
+            };
+
+            ferron_core::validate_nested!(cgi, used(sub), environment, args(2) => [ServerConfigurationValue::String(_, _) | ServerConfigurationValue::InterpolatedString(_, _), ServerConfigurationValue::String(_, _) | ServerConfigurationValue::InterpolatedString(_, _)]);
+            ferron_core::check_unused_subdirectives!(cgi, sub, &mut ctx.diagnostics, ctx.scope.clone());
+        });
+
+        Ok(())
+    }
+}

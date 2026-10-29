@@ -1,0 +1,654 @@
+use ferron_core::config_validator_scoped_key;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::time::{interval, Duration, MissedTickBehavior};
+
+use ferron_core::config::ServerConfigurationBlock;
+use ferron_core::loader::ModuleLoader;
+use ferron_core::providers::Provider;
+use ferron_core::registry::Registry;
+use ferron_core::{log_error, Module};
+use ferron_observability::module::{
+    config_uses_provider, format_metadata_prefix, try_send_event, ConfiguredEvent,
+    SharedEventChannel,
+};
+use ferron_observability::{
+    AccessEvent, AccessVisitor, ApplicationLogFormatterContext, Event, EventSink,
+    LogAttributeValue, LogEvent, LogFormatterContext, ObservabilityContext,
+};
+
+use crate::rotate::{rotate_log_file, RotationConfig};
+
+mod rotate;
+mod validator;
+
+/// The initialized event sink that writes events to log files
+struct LogFileEventSink {
+    inner: async_channel::Sender<ConfiguredEvent>,
+    log_config: Arc<ServerConfigurationBlock>,
+    control_plane_metadata: Option<Arc<BTreeMap<String, String>>>,
+}
+
+impl EventSink for LogFileEventSink {
+    #[inline]
+    fn emit(&self, event: Event) {
+        if matches!(event, Event::Access(_) | Event::Log(_)) {
+            try_send_event(
+                &self.inner,
+                Arc::new(event),
+                &self.log_config,
+                &self.control_plane_metadata,
+                "file",
+            );
+        }
+    }
+
+    #[inline]
+    fn emit_arc(&self, event: std::sync::Arc<Event>) {
+        if matches!(&*event, Event::Access(_) | Event::Log(_)) {
+            try_send_event(
+                &self.inner,
+                event,
+                &self.log_config,
+                &self.control_plane_metadata,
+                "file",
+            );
+        }
+    }
+
+    #[inline]
+    fn processes_access(&self) -> bool {
+        true
+    }
+}
+
+/// File handle wrapper with BufWriter and rotation support
+struct FileHandle {
+    writer: BufWriter<tokio::fs::File>,
+    current_size: u64,
+    rotation: Option<RotationConfig>,
+}
+
+/// Manages buffered file handles and flushing
+struct FileWriter {
+    handles: HashMap<String, FileHandle>,
+    flush_interval_ms: u64,
+}
+
+impl FileWriter {
+    fn new(flush_interval_ms: u64) -> Self {
+        Self {
+            handles: HashMap::new(),
+            flush_interval_ms,
+        }
+    }
+
+    /// Ensure a file handle exists for the given path
+    async fn ensure_handle(
+        &mut self,
+        path: &str,
+        rotation: Option<RotationConfig>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.handles.contains_key(path) {
+            let path_buf: std::path::PathBuf = path.into();
+
+            if let Some(parent) = path_buf.parent() {
+                let _ = tokio::fs::create_dir_all(&parent).await;
+            }
+
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path_buf)
+                .await;
+
+            match file {
+                Ok(file) => {
+                    let current_size = file.metadata().await?.len();
+                    self.handles.insert(
+                        path.to_string(),
+                        FileHandle {
+                            writer: BufWriter::with_capacity(131072, file),
+                            current_size,
+                            rotation,
+                        },
+                    );
+                }
+                Err(e) => {
+                    log_error!("Failed to open log file {}: {}", path, e);
+                    return Err(Box::new(e));
+                }
+            }
+        }
+
+        // Update rotation config if it changed
+        if let Some(handle) = self.handles.get_mut(path) {
+            handle.rotation = rotation;
+        }
+
+        Ok(())
+    }
+
+    /// Write content to a log file, rotating if necessary
+    async fn write_to_file(
+        &mut self,
+        path: &str,
+        content: &[u8],
+        rotation: Option<RotationConfig>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.ensure_handle(path, rotation).await?;
+
+        // Check if rotation is needed
+        let needs_rotation = rotation.and_then(|r| r.rotate_size).is_some_and(|rot| {
+            self.handles
+                .get(path)
+                .is_some_and(|h| h.current_size >= rot)
+        });
+
+        if needs_rotation {
+            // Flush and remove the old handle
+            if let Some(mut handle) = self.handles.remove(path) {
+                if let Err(e) = handle.writer.flush().await {
+                    log_error!("Failed to flush log file before rotation {}: {}", path, e);
+                }
+            }
+
+            let rotate_keep = rotation.and_then(|r| r.rotate_keep);
+            if let Err(e) = rotate_log_file(path, rotate_keep).await {
+                log_error!("Failed to rotate log file {}: {}", path, e);
+            }
+
+            // Re-open the file
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+            {
+                Ok(file) => {
+                    self.handles.insert(
+                        path.to_string(),
+                        FileHandle {
+                            writer: BufWriter::with_capacity(131072, file),
+                            current_size: 0,
+                            rotation,
+                        },
+                    );
+                }
+                Err(e) => {
+                    log_error!("Failed to re-open log file after rotation {}: {}", path, e);
+                    return Err(Box::new(e));
+                }
+            }
+        }
+
+        if let Some(handle) = self.handles.get_mut(path) {
+            handle.writer.write_all(content).await?;
+            handle.current_size += content.len() as u64;
+        }
+
+        Ok(())
+    }
+
+    async fn flush_all(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        for handle in self.handles.values_mut() {
+            handle.writer.flush().await?;
+        }
+        Ok(())
+    }
+}
+
+struct LogFileObservabilityModule {
+    inner: async_channel::Receiver<ConfiguredEvent>,
+    cancel_token: tokio_util::sync::CancellationToken,
+    registry: Arc<Registry>,
+}
+
+impl Module for LogFileObservabilityModule {
+    fn name(&self) -> &str {
+        "observability-logfile"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn start(
+        &self,
+        runtime: &mut ferron_core::runtime::Runtime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cancel_token = self.cancel_token.clone();
+        let registry = self.registry.clone();
+
+        let rx = self.inner.clone();
+        runtime.spawn_secondary_task(async move {
+            let mut file_writer = FileWriter::new(100);
+            let mut flush_timer = interval(Duration::from_millis(file_writer.flush_interval_ms));
+            flush_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    result = rx.recv() => {
+                        if let Ok(msg) = result {
+                            ferron_core::admin::ADMIN_METRICS
+                                .observability_event_queue_len
+                                .fetch_sub(1, Ordering::Relaxed);
+
+                            match &*msg.event {
+                                Event::Access(ae) => {
+                                    let access_variables = access_event_variables(ae);
+                                    if let Some(access_log_path) =
+                                      msg.log_config.get_value("access_log")
+                                          .and_then(|v|
+                                           v.as_string_with_interpolations(&access_variables)) {
+                                        if let Some(message) =
+                                          format_access_event(ae, &msg.log_config, &registry) {
+                                            // Prefer event-level metadata over provider-level metadata
+                                            let event_metadata = ae.control_plane_metadata()
+                                                .map(|m| std::sync::Arc::new(m.clone()));
+                                            let effective_metadata = event_metadata.as_ref()
+                                                .or(msg.control_plane_metadata.as_ref());
+                                            let cp_prefix =
+                                                format_metadata_prefix(effective_metadata);
+                                            let mut line = format!("{}{}", cp_prefix, message);
+                                            line.push('\n');
+
+                                            // Read rotation config
+                                            let rotation = RotationConfig::read_from_config(
+                                                &msg.log_config,
+                                                "access_log_rotate_size",
+                                                "access_log_rotate_keep",
+                                            );
+
+                                            let _ = file_writer
+                                            .write_to_file(&access_log_path,
+                                                line.as_bytes(),
+                                                rotation)
+                                            .await;
+                                        }
+                                    }
+                                }
+                                Event::Log(le) => {
+                                    let log_variables = log_event_variables(le);
+                                    let log_path = msg.log_config
+                                        .get_value("error_log")
+                                        .and_then(|v| v
+                                            .as_string_with_interpolations(&log_variables));
+
+                                    if let Some(log_path) = log_path {
+                                        if let Some(mut message) =
+                                          format_log_event(le, &msg.log_config, &registry) {
+                                        message = message.to_string().replace("\n", "\n  ");
+                                        message.push('\n');
+
+                                        // Read rotation config for error log
+                                        let rotation = RotationConfig::read_from_config(
+                                            &msg.log_config,
+                                            "error_log_rotate_size",
+                                            "error_log_rotate_keep",
+                                        );
+
+                                        let _ = file_writer
+                                            .write_to_file(&log_path, message.as_bytes(), rotation)
+                                            .await;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Ignore other event types
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    _ = flush_timer.tick() => {
+                        if let Err(e) = file_writer.flush_all().await {
+                            log_error!("Failed to flush log files: {}", e);
+                        }
+                    }
+                    _ = cancel_token.cancelled() => {
+                        let _ = file_writer.flush_all().await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+}
+
+impl Drop for LogFileObservabilityModule {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
+
+/// Collects access event fields into a HashMap for variable interpolation in log filenames.
+/// All variable names are prefixed with `accesslog.`.
+fn access_event_variables(access_event: &Arc<dyn AccessEvent>) -> HashMap<String, String> {
+    struct Collector {
+        fields: HashMap<String, String>,
+    }
+
+    impl AccessVisitor for Collector {
+        fn field_string(&mut self, name: &str, value: &str) {
+            self.fields
+                .insert(format!("accesslog.{}", name), value.to_string());
+        }
+
+        fn field_u64(&mut self, name: &str, value: u64) {
+            self.fields
+                .insert(format!("accesslog.{}", name), value.to_string());
+        }
+
+        fn field_f64(&mut self, name: &str, value: f64) {
+            self.fields
+                .insert(format!("accesslog.{}", name), value.to_string());
+        }
+
+        fn field_bool(&mut self, name: &str, value: bool) {
+            self.fields
+                .insert(format!("accesslog.{}", name), value.to_string());
+        }
+    }
+
+    let mut collector = Collector {
+        fields: HashMap::new(),
+    };
+    access_event.visit(&mut collector);
+    collector.fields
+}
+
+/// Collects log event fields into a HashMap for variable interpolation in log filenames.
+/// All variable names are prefixed with `log.`.
+fn log_event_variables(log_event: &LogEvent) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+
+    fields.insert(
+        "log.level".to_string(),
+        match log_event.level {
+            ferron_observability::LogLevel::Error => "ERROR",
+            ferron_observability::LogLevel::Warn => "WARN",
+            ferron_observability::LogLevel::Info => "INFO",
+            ferron_observability::LogLevel::Debug => "DEBUG",
+        }
+        .to_string(),
+    );
+    fields.insert("log.target".to_string(), log_event.target.to_string());
+    fields.insert("log.message".to_string(), log_event.message.clone());
+    fields.insert("log.summary".to_string(), log_event.summary.to_string());
+
+    for (name, value) in &log_event.attributes {
+        let value_str = match value {
+            LogAttributeValue::String(s) => s.clone(),
+            LogAttributeValue::StaticStr(s) => s.to_string(),
+            LogAttributeValue::Bool(b) => b.to_string(),
+            LogAttributeValue::I64(i) => i.to_string(),
+            LogAttributeValue::F64(f) => f.to_string(),
+        };
+        fields.insert(format!("log.{}", name), value_str);
+    }
+
+    if let Some(trace_context) = &log_event.trace_context {
+        if let Ok(trace_id) = std::str::from_utf8(&trace_context.trace_id) {
+            fields.insert("log.trace_id".to_string(), trace_id.to_string());
+        }
+        if let Ok(span_id) = std::str::from_utf8(&trace_context.span_id) {
+            fields.insert("log.span_id".to_string(), span_id.to_string());
+        }
+    }
+
+    fields
+}
+
+fn format_access_event(
+    access_event: &Arc<dyn AccessEvent>,
+    log_config: &Arc<ServerConfigurationBlock>,
+    registry: &Registry,
+) -> Option<String> {
+    let formatter_name = log_config
+        .get_value("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("text");
+
+    // Try to resolve the formatter from the registry
+    if let Some(formatter_registry) = registry.get_provider_registry::<LogFormatterContext>() {
+        if let Some(formatter) = formatter_registry.get(formatter_name) {
+            let mut ctx = LogFormatterContext {
+                access_event: access_event.clone(),
+                log_config: log_config.clone(),
+                output: None,
+            };
+            if formatter.execute(&mut ctx).is_ok() {
+                if let Some(output) = ctx.output {
+                    return Some(output);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn format_log_event(
+    log_event: &LogEvent,
+    log_config: &Arc<ServerConfigurationBlock>,
+    registry: &Registry,
+) -> Option<String> {
+    let formatter_name = log_config
+        .get_value("error_format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("text");
+
+    // Try to resolve the formatter from the registry
+    if let Some(formatter_registry) =
+        registry.get_provider_registry::<ApplicationLogFormatterContext<'static>>()
+    {
+        if let Some(formatter) = formatter_registry.get(formatter_name) {
+            // SAFETY: We know that the lifetime of the log event is longer
+            //         than the lifetime of the resolver. but "'static"
+            //         is the only lifetime we can use here. This
+            //         constraint is enforced by the provider registry.
+            let log_event =
+                unsafe { std::mem::transmute::<&LogEvent, &'static LogEvent>(log_event) };
+            let mut ctx = ApplicationLogFormatterContext {
+                log_event,
+                log_config: log_config.clone(),
+                output: None,
+            };
+            if formatter.execute(&mut ctx).is_ok() {
+                if let Some(output) = ctx.output {
+                    return Some(output);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+struct LogFileObservabilityProvider {
+    shared: Arc<SharedEventChannel>,
+}
+
+impl Provider<ObservabilityContext> for LogFileObservabilityProvider {
+    fn name(&self) -> &str {
+        "file"
+    }
+
+    fn execute(&self, ctx: &mut ObservabilityContext) -> Result<(), Box<dyn std::error::Error>> {
+        ctx.sink = Some(Arc::new(LogFileEventSink {
+            inner: self.shared.get_or_init().0.clone(),
+            log_config: ctx.log_config.clone(),
+            control_plane_metadata: ctx.control_plane_metadata.clone(),
+        }));
+        Ok(())
+    }
+}
+
+pub struct LogFileObservabilityModuleLoader {
+    cache: Option<Arc<LogFileObservabilityModule>>,
+    shared: Arc<SharedEventChannel>,
+}
+
+impl Default for LogFileObservabilityModuleLoader {
+    fn default() -> Self {
+        Self {
+            cache: None,
+            // Allocated lazily once the backend is selected by the
+            // configuration, avoiding ~4 MB of idle memory when unused.
+            shared: Arc::new(SharedEventChannel::new()),
+        }
+    }
+}
+
+impl ModuleLoader for LogFileObservabilityModuleLoader {
+    fn register_providers(
+        &mut self,
+        registry: ferron_core::registry::RegistryBuilder,
+    ) -> ferron_core::registry::RegistryBuilder {
+        let shared = self.shared.clone();
+
+        registry.with_provider::<ObservabilityContext, _>(move || {
+            Arc::new(LogFileObservabilityProvider {
+                shared: shared.clone(),
+            })
+        })
+    }
+
+    fn register_modules(
+        &mut self,
+        registry: Arc<ferron_core::registry::Registry>,
+        modules: &mut Vec<Arc<dyn ferron_core::Module>>,
+        config: Arc<ferron_core::config::ServerConfiguration>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !config_uses_provider(&config, "file") {
+            return Ok(());
+        }
+        if self.cache.is_none() {
+            let module = Arc::new(LogFileObservabilityModule {
+                inner: self.shared.get_or_init().1.clone(),
+                cancel_token: tokio_util::sync::CancellationToken::new(),
+                registry,
+            });
+
+            self.cache = Some(module.clone());
+            modules.push(module);
+        }
+
+        Ok(())
+    }
+
+    fn register_directives(&mut self, registry: &mut ferron_core::directives::DirectiveRegistry) {
+        use ferron_core::directives::{Directive, DirectiveSubblock};
+        registry
+            .register(
+                Directive {
+                    name: "access_log",
+                    usage: "access_log <path>",
+                    description: "This directive specifies the path to the access log file.",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            )
+            .register(
+                Directive {
+                    name: "access_log_rotate_size",
+                    usage: "access_log_rotate_size <size>",
+                    description: "This directive specifies the maximum size of the access log file before rotation.",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            )
+            .register(
+                Directive {
+                    name: "access_log_rotate_keep",
+                    usage: "access_log_rotate_keep <count>",
+                    description: "This directive specifies the number of rotated access log files to keep.",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            )
+            .register(
+                Directive {
+                    name: "error_log",
+                    usage: "error_log <path>",
+                    description: "This directive specifies the path to the error log file.",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            )
+            .register(
+                Directive {
+                    name: "error_log_rotate_size",
+                    usage: "error_log_rotate_size <size>",
+                    description: "This directive specifies the maximum size of the error log file before rotation.",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            )
+            .register(
+                Directive {
+                    name: "error_log_rotate_keep",
+                    usage: "error_log_rotate_keep <count>",
+                    description: "This directive specifies the number of rotated error log files to keep.",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            )
+            .register(
+                Directive {
+                    name: "format",
+                    usage: "format { ... }",
+                    description: "This directive configures the access log format. Delegates to a log format sub-block (text or json).",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            )
+            .register(
+                Directive {
+                    name: "error_format",
+                    usage: "error_format { ... }",
+                    description: "This directive configures the error log format. Delegates to a log format sub-block (text or json).",
+                    applicable_protocols: None,
+                    global_only: false,
+                    subblock_link: None,
+                },
+                DirectiveSubblock::custom("observability"),
+            );
+    }
+
+    fn register_scoped_configuration_validators(
+        &mut self,
+        registry: &mut HashMap<
+            ferron_core::config::validator::ConfigurationValidatorScopedKey,
+            Box<dyn ferron_core::config::validator::ConfigurationValidator>,
+        >,
+    ) {
+        registry.insert(
+            config_validator_scoped_key!("observability", "file"),
+            Box::new(validator::LogFileObservabilityConfigurationValidator),
+        );
+    }
+}

@@ -1,0 +1,186 @@
+//! Admin API server module.
+//!
+//! Spawns a standalone axum HTTP server on a secondary Tokio runtime
+//! for administrative endpoints.
+
+mod mutex;
+mod router;
+
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use ferron_core::config::ServerConfiguration;
+use ferron_core::registry::Registry;
+use ferron_core::runtime::Runtime;
+use ferron_core::Module;
+use ferron_observability::CompositeEventSink;
+use hyper::service::service_fn;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::AdminConfig;
+use crate::handlers::AdminState;
+use crate::server::router::request_fn;
+
+/// Admin API module implementing the `Module` trait.
+///
+/// Runs a separate axum HTTP server on a configurable port
+/// using a secondary Tokio runtime (control plane isolation).
+pub struct AdminApiModule {
+    /// Atomic swap for admin config (endpoint enable/disable, listen address).
+    config: Arc<ArcSwap<AdminConfig>>,
+    /// Full server configuration, used by the `/config` endpoint.
+    full_config: Arc<ArcSwap<ServerConfiguration>>,
+    /// Token cancelled on reload to gracefully shut down the admin listener.
+    reload_token: ArcSwap<CancellationToken>,
+    /// Observability event sink for emitting metrics and logs.
+    events: ArcSwap<CompositeEventSink>,
+}
+
+impl AdminApiModule {
+    /// Create a new admin API module.
+    pub fn new(
+        registry: &Arc<Registry>,
+        admin_config: AdminConfig,
+        full_config: Arc<ServerConfiguration>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let events_arc =
+            ferron_observability::build_composite_sink(registry, &full_config.global_config, None)?;
+        let events = Arc::try_unwrap(events_arc).unwrap_or_else(|arc| (*arc).clone());
+
+        Ok(Self {
+            config: Arc::new(ArcSwap::new(Arc::new(admin_config))),
+            full_config: Arc::new(ArcSwap::new(full_config)),
+            reload_token: ArcSwap::from_pointee(CancellationToken::new()),
+            events: ArcSwap::from_pointee(events),
+        })
+    }
+
+    /// Reload the module with new admin configuration.
+    ///
+    /// Called during configuration reload (SIGHUP) when the `admin {}` block changes.
+    /// Atomically replaces the config and cancels the old reload token to gracefully
+    /// shut down the existing listener.
+    pub fn reload(
+        &self,
+        registry: &Arc<Registry>,
+        admin_config: AdminConfig,
+        full_config: Arc<ServerConfiguration>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Cancel the old reload token to trigger graceful shutdown
+        let old_token = self.reload_token.load();
+        old_token.cancel();
+
+        // Rebuild the observability sink with the new config
+        let events_arc =
+            ferron_observability::build_composite_sink(registry, &full_config.global_config, None)?;
+        let events = Arc::try_unwrap(events_arc).unwrap_or_else(|arc| (*arc).clone());
+
+        // Atomically swap the config
+        self.config.store(Arc::new(admin_config));
+        self.full_config.store(full_config);
+        self.events.store(Arc::new(events));
+
+        self.reload_token.store(Arc::new(CancellationToken::new()));
+
+        Ok(())
+    }
+}
+
+impl Module for AdminApiModule {
+    fn name(&self) -> &str {
+        "admin-api"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn start(&self, runtime: &mut Runtime) -> Result<(), Box<dyn std::error::Error>> {
+        let config = self.config.load_full();
+        let full_config = self.full_config.load_full();
+        let events = Arc::new((*self.events.load_full()).clone());
+
+        // Clone the CancellationToken so the spawned task owns it
+        let reload_token = (*self.reload_token.load_full()).clone();
+
+        // Spawn on secondary runtime (control plane isolation)
+        runtime.spawn_secondary_task(async move {
+            let listener_mutex = mutex::ListenerMutexGuard::acquire().await;
+            let state = AdminState {
+                full_config,
+                events,
+            };
+
+            match tokio::net::TcpListener::bind(config.listen).await {
+                Ok(listener) => {
+                    ferron_core::log_info!("Admin API listening on {}", config.listen);
+                    let reload_tokenc = reload_token.clone();
+                    let mut server = Box::pin(async move {
+                        loop {
+                            let Ok((sock, _)) = (tokio::select! {
+                                _ = reload_tokenc.cancelled() => {
+                                    let _ = listener;
+                                    break;
+                                }
+                                r = listener.accept() => {
+                                    r
+                                }
+                            }) else {
+                                continue;
+                            };
+
+                            let _ = sock.set_nodelay(true);
+
+                            let state = state.clone();
+                            let config = config.clone();
+                            let reload_token = reload_tokenc.clone();
+
+                            tokio::spawn(async move {
+                                let mut conn_fut = hyper::server::conn::http1::Builder::new()
+                                    .timer(hyper_util::rt::TokioTimer::default())
+                                    .serve_connection(
+                                        hyper_util::rt::TokioIo::new(sock),
+                                        service_fn(|request| {
+                                            request_fn(request, state.clone(), config.clone())
+                                        }),
+                                    );
+                                let mut conn_fut_pin = std::pin::Pin::new(&mut conn_fut);
+                                tokio::select! {
+                                    _ = reload_token.cancelled() => {
+                                        conn_fut_pin.graceful_shutdown();
+                                        let _ = conn_fut.await;
+                                    }
+                                    _ = &mut conn_fut_pin => {}
+                                }
+                            });
+                        }
+                    });
+                    tokio::select! {
+                        _ = reload_token.cancelled() => {
+                            ferron_core::log_info!("Admin API shutting down (reload)");
+                            server.await
+                        }
+                        _ = &mut server => {}
+                    }
+                }
+                Err(e) => {
+                    ferron_core::log_error!(
+                        "Failed to bind admin API listener on {}: {}",
+                        config.listen,
+                        e
+                    );
+                }
+            }
+
+            drop(listener_mutex);
+        });
+
+        Ok(())
+    }
+}
+
+impl Drop for AdminApiModule {
+    fn drop(&mut self) {
+        self.reload_token.load().cancel();
+    }
+}

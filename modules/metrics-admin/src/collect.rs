@@ -1,0 +1,271 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use ferron_core::admin::{check_config_drift, AdminMetrics, ADMIN_METRICS};
+use ferron_observability::{
+    CompositeEventSink, Event, LogEvent, MetricEvent, MetricType, MetricValue,
+};
+
+/// Runs the background admin API metrics collection loop.
+///
+/// Collects metrics every 1 second and emits them through the composite event sink.
+pub async fn collect_admin_metrics(
+    event_sink: Arc<CompositeEventSink>,
+    cancel_token: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+
+        emit_metrics(&event_sink, &ADMIN_METRICS);
+        emit_drift_check(&event_sink, &ADMIN_METRICS);
+    }
+}
+
+fn emit_metrics(event_sink: &CompositeEventSink, metrics: &AdminMetrics) {
+    emit_core_metrics(event_sink, metrics);
+    emit_reload_metrics(event_sink, metrics);
+    emit_runtime_metrics(event_sink, metrics);
+    emit_config_metrics(event_sink, metrics);
+}
+
+fn emit_core_metrics(event_sink: &CompositeEventSink, metrics: &AdminMetrics) {
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.uptime",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::F64(metrics.start_time.elapsed().as_secs_f64()),
+        unit: Some("s"),
+        description: Some("Time since the server started."),
+        trace_context: None,
+    }));
+
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.connections_active",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::U64(
+            metrics
+                .connections_active
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        unit: Some("{connection}"),
+        description: Some("Currently open TCP connections across all HTTP listeners."),
+        trace_context: None,
+    }));
+
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.requests_total",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::U64(
+            metrics
+                .requests_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        unit: Some("{request}"),
+        description: Some("Total HTTP requests served across all listeners."),
+        trace_context: None,
+    }));
+}
+
+fn emit_reload_metrics(event_sink: &CompositeEventSink, metrics: &AdminMetrics) {
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.reloads",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::U64(metrics.reloads.load(std::sync::atomic::Ordering::Relaxed)),
+        unit: Some("{reload}"),
+        description: Some("Number of configuration reloads performed."),
+        trace_context: None,
+    }));
+
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.observability_events_dropped",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::U64(
+            metrics
+                .observability_events_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        unit: Some("{event}"),
+        description: Some("Total number of observability events dropped due to backpressure."),
+        trace_context: None,
+    }));
+
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.observability_event_queue_len",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::U64(
+            metrics
+                .observability_event_queue_len
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        unit: Some("{event}"),
+        description: Some("Approximate current length of the observability event queue."),
+        trace_context: None,
+    }));
+
+    {
+        let reload_metrics = metrics.reload_metrics.read();
+
+        event_sink.emit(Event::Metric(MetricEvent {
+            name: "ferron.admin.reload.successful",
+            attributes: vec![],
+            ty: MetricType::Gauge,
+            value: MetricValue::U64(if reload_metrics.last_reload_error.is_some() {
+                0
+            } else {
+                1
+            }),
+            unit: Some("{enabled}"),
+            description: Some("Whether the last configuration reload was successful."),
+            trace_context: None,
+        }));
+
+        event_sink.emit(Event::Metric(MetricEvent {
+            name: "ferron.admin.reload.active_generation",
+            attributes: vec![],
+            ty: MetricType::Gauge,
+            value: MetricValue::U64(reload_metrics.active_generation),
+            unit: Some("{generation}"),
+            description: Some("Active generation of the configuration being reloaded."),
+            trace_context: None,
+        }));
+    }
+}
+
+fn emit_runtime_metrics(event_sink: &CompositeEventSink, metrics: &AdminMetrics) {
+    let runtime_metrics = metrics.runtime_metrics.read();
+
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.runtime.primary_threads",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::U64(runtime_metrics.primary_threads as u64),
+        unit: Some("{thread}"),
+        description: Some("Number of primary threads."),
+        trace_context: None,
+    }));
+
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.runtime.io_uring_supported",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::U64(if runtime_metrics.io_uring_supported {
+            1
+        } else {
+            0
+        }),
+        unit: Some("{enabled}"),
+        description: Some("Whether io_uring is supported."),
+        trace_context: None,
+    }));
+
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.runtime.io_uring_runtime_enabled",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::U64(if runtime_metrics.io_uring_runtime_enabled {
+            1
+        } else {
+            0
+        }),
+        unit: Some("{enabled}"),
+        description: Some("Whether io_uring is enabled at runtime."),
+        trace_context: None,
+    }));
+}
+
+fn emit_config_metrics(event_sink: &CompositeEventSink, metrics: &AdminMetrics) {
+    {
+        let config_mtime = metrics.config_mtime.read();
+        let mtime_epoch = config_mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        event_sink.emit(Event::Metric(MetricEvent {
+            name: "ferron.admin.config_mtime",
+            attributes: vec![],
+            ty: MetricType::Gauge,
+            value: MetricValue::F64(mtime_epoch),
+            unit: Some("s"),
+            description: Some(
+                "Last modification time of the configuration source (epoch seconds).",
+            ),
+            trace_context: None,
+        }));
+    }
+
+    event_sink.emit(Event::Metric(MetricEvent {
+        name: "ferron.admin.config_drift",
+        attributes: vec![],
+        ty: MetricType::Gauge,
+        value: MetricValue::U64(
+            if metrics
+                .config_drift
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                1
+            } else {
+                0
+            },
+        ),
+        unit: Some("{drift}"),
+        description: Some("Whether configuration drift is detected (1 = drift, 0 = no drift)."),
+        trace_context: None,
+    }));
+}
+
+/// Check for configuration drift and emit log events on state transitions.
+fn emit_drift_check(event_sink: &CompositeEventSink, metrics: &AdminMetrics) {
+    if !metrics
+        .config_drift_hints_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+
+    let drift_metadata = metrics.config_drift_metadata.read();
+    let Some(metadata) = drift_metadata.as_ref() else {
+        return;
+    };
+    let is_drift = check_config_drift(metadata);
+    drop(drift_metadata);
+
+    let was_drift = metrics
+        .config_drift
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    if is_drift && !was_drift {
+        // Transition: no drift -> drift detected
+        event_sink.emit(Event::Log(LogEvent {
+            level: ferron_observability::LogLevel::Warn,
+            message: "Configuration drift detected: configuration source has changed but has not been reloaded".to_string(),
+            summary: "Configuration drift detected".into(),
+            target: "ferron-metrics-admin",
+            attributes: vec![],
+            trace_context: None,
+
+        }));
+    } else if !is_drift && was_drift {
+        // Transition: drift -> no drift (resolved after reload)
+        event_sink.emit(Event::Log(LogEvent {
+            level: ferron_observability::LogLevel::Info,
+            message: "Configuration drift resolved: configuration has been reloaded".to_string(),
+            summary: "Configuration drift resolved".into(),
+            target: "ferron-metrics-admin",
+            attributes: vec![],
+            trace_context: None,
+        }));
+    }
+
+    metrics
+        .config_drift
+        .store(is_drift, std::sync::atomic::Ordering::Relaxed);
+}

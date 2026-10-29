@@ -1,0 +1,301 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use ferron_core::config::validator::{
+    validate_scoped_block_flat, ConfigurationValidationError, ConfigurationValidator,
+};
+use ferron_core::config::ServerConfigurationBlock;
+use ferron_core::loader::ModuleLoader;
+use ferron_core::providers::Provider;
+use ferron_core::registry::Registry;
+use ferron_core::{config_validator_scoped_key, log_debug, log_error, log_info, log_warn, Module};
+use ferron_observability::module::{
+    config_uses_provider, format_metadata_prefix, try_send_event, ConfiguredEvent,
+    SharedEventChannel,
+};
+use ferron_observability::{
+    AccessEvent, Event, EventSink, LogFormatterContext, ObservabilityContext,
+};
+struct ConsoleEventSink {
+    inner: async_channel::Sender<ConfiguredEvent>,
+    log_config: Arc<ServerConfigurationBlock>,
+    control_plane_metadata: Option<Arc<BTreeMap<String, String>>>,
+}
+
+impl EventSink for ConsoleEventSink {
+    #[inline]
+    fn emit(&self, event: Event) {
+        if matches!(event, Event::Access(_) | Event::Log(_)) {
+            try_send_event(
+                &self.inner,
+                Arc::new(event),
+                &self.log_config,
+                &self.control_plane_metadata,
+                "console",
+            );
+        }
+    }
+
+    #[inline]
+    fn emit_arc(&self, event: std::sync::Arc<Event>) {
+        if matches!(&*event, Event::Access(_) | Event::Log(_)) {
+            try_send_event(
+                &self.inner,
+                event,
+                &self.log_config,
+                &self.control_plane_metadata,
+                "console",
+            );
+        }
+    }
+
+    fn processes_access(&self) -> bool {
+        true
+    }
+}
+
+struct ConsoleObservabilityModule {
+    inner: async_channel::Receiver<ConfiguredEvent>,
+    cancel_token: tokio_util::sync::CancellationToken,
+    registry: Arc<Registry>,
+}
+
+impl Module for ConsoleObservabilityModule {
+    fn name(&self) -> &str {
+        "observability-consolelog"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn start(
+        &self,
+        _runtime: &mut ferron_core::runtime::Runtime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cancel_token = self.cancel_token.clone();
+        let registry = self.registry.clone();
+
+        let rx = self.inner.clone();
+        // Offload logging to a separate thread
+        let thread_result = std::thread::Builder::new()
+            .name("Console logging".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("Failed to create current-thread runtime for console logging");
+                rt.block_on(async move {
+                    while let Some(msg) = tokio::select! {
+                        result = rx.recv() => {
+                            result.ok()
+                        }
+                        _ = cancel_token.cancelled() => {
+                            None
+                        }
+                    } {
+                        ferron_core::admin::ADMIN_METRICS
+                            .observability_event_queue_len
+                            .fetch_sub(1, Ordering::Relaxed);
+
+                        match &*msg.event {
+                            ferron_observability::Event::Access(ae) => {
+                                // Prefer event-level metadata over provider-level metadata
+                                let event_metadata = ae
+                                    .control_plane_metadata()
+                                    .map(|m| std::sync::Arc::new(m.clone()));
+                                let effective_metadata = event_metadata
+                                    .as_ref()
+                                    .or(msg.control_plane_metadata.as_ref());
+                                let cp_prefix = format_metadata_prefix(effective_metadata);
+                                let message = format_access_event(ae, &msg.log_config, &registry);
+                                if let Some(message) = message {
+                                    log_info!("{}{}", cp_prefix, message);
+                                }
+                            }
+                            ferron_observability::Event::Log(le) => {
+                                let trace_id_part = le
+                                    .trace_context
+                                    .as_ref()
+                                    .and_then(|t| str::from_utf8(&t.trace_id).ok())
+                                    .map(|tid| format!("[trace={}] ", tid))
+                                    .unwrap_or_default();
+                                match le.level {
+                                    ferron_observability::LogLevel::Error => {
+                                        log_error!("{}{}", trace_id_part, le.message)
+                                    }
+                                    ferron_observability::LogLevel::Warn => {
+                                        log_warn!("{}{}", trace_id_part, le.message)
+                                    }
+                                    ferron_observability::LogLevel::Info => {
+                                        log_info!("{}{}", trace_id_part, le.message)
+                                    }
+                                    ferron_observability::LogLevel::Debug => {
+                                        log_debug!("{}{}", trace_id_part, le.message)
+                                    }
+                                }
+                            }
+                            _ => (), // Ignore unsupported event types
+                        }
+                    }
+                });
+            });
+        if let Err(err) = thread_result {
+            log_warn!("Failed to start console logging thread: {}", err)
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for ConsoleObservabilityModule {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
+
+fn format_access_event(
+    access_event: &Arc<dyn AccessEvent>,
+    log_config: &Arc<ServerConfigurationBlock>,
+    registry: &Registry,
+) -> Option<String> {
+    let formatter_name = log_config
+        .get_value("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("text");
+
+    // Try to resolve the formatter from the registry
+    if let Some(formatter_registry) = registry.get_provider_registry::<LogFormatterContext>() {
+        if let Some(formatter) = formatter_registry.get(formatter_name) {
+            let mut ctx = LogFormatterContext {
+                access_event: access_event.clone(),
+                log_config: log_config.clone(),
+                output: None,
+            };
+            if formatter.execute(&mut ctx).is_ok() {
+                if let Some(output) = ctx.output {
+                    return Some(output);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+struct ConsoleObservabilityProvider {
+    shared: Arc<SharedEventChannel>,
+}
+
+impl Provider<ObservabilityContext> for ConsoleObservabilityProvider {
+    fn name(&self) -> &str {
+        "console"
+    }
+
+    fn execute(&self, ctx: &mut ObservabilityContext) -> Result<(), Box<dyn std::error::Error>> {
+        ctx.sink = Some(Arc::new(ConsoleEventSink {
+            inner: self.shared.get_or_init().0.clone(),
+            log_config: ctx.log_config.clone(),
+            control_plane_metadata: ctx.control_plane_metadata.clone(),
+        }));
+        Ok(())
+    }
+}
+
+pub struct ConsoleObservabilityModuleLoader {
+    cache: Option<Arc<ConsoleObservabilityModule>>,
+    shared: Arc<SharedEventChannel>,
+}
+
+impl Default for ConsoleObservabilityModuleLoader {
+    fn default() -> Self {
+        Self {
+            cache: None,
+            // The event channel is allocated lazily once the backend is
+            // actually selected by the configuration (see `register_modules`
+            // and provider `execute`), avoiding ~4 MB of idle memory per
+            // unused backend.
+            shared: Arc::new(SharedEventChannel::new()),
+        }
+    }
+}
+
+impl ModuleLoader for ConsoleObservabilityModuleLoader {
+    fn register_providers(
+        &mut self,
+        registry: ferron_core::registry::RegistryBuilder,
+    ) -> ferron_core::registry::RegistryBuilder {
+        let shared = self.shared.clone();
+
+        registry.with_provider::<ObservabilityContext, _>(move || {
+            Arc::new(ConsoleObservabilityProvider {
+                shared: shared.clone(),
+            })
+        })
+    }
+
+    fn register_modules(
+        &mut self,
+        registry: Arc<ferron_core::registry::Registry>,
+        modules: &mut Vec<Arc<dyn ferron_core::Module>>,
+        config: Arc<ferron_core::config::ServerConfiguration>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !config_uses_provider(&config, "console") {
+            return Ok(());
+        }
+        if self.cache.is_none() {
+            let module = Arc::new(ConsoleObservabilityModule {
+                inner: self.shared.get_or_init().1.clone(),
+                cancel_token: tokio_util::sync::CancellationToken::new(),
+                registry,
+            });
+
+            self.cache = Some(module.clone());
+            modules.push(module);
+        }
+
+        Ok(())
+    }
+
+    fn register_directives(&mut self, registry: &mut ferron_core::directives::DirectiveRegistry) {
+        use ferron_core::directives::{Directive, DirectiveSubblock};
+        registry.register(
+            Directive {
+                name: "format",
+                usage: "format { ... }",
+                description: "This directive configures the log format for the console provider. Delegates to a log format sub-block (text or json).",
+                applicable_protocols: None,
+                global_only: false,
+                subblock_link: None,
+            },
+            DirectiveSubblock::custom("observability"),
+        );
+    }
+
+    fn register_scoped_configuration_validators(
+        &mut self,
+        registry: &mut std::collections::HashMap<
+            ferron_core::config::validator::ConfigurationValidatorScopedKey,
+            Box<dyn ferron_core::config::validator::ConfigurationValidator>,
+        >,
+    ) {
+        registry.insert(
+            config_validator_scoped_key!("observability", "console"),
+            Box::new(ConsoleObservabilityConfigValidator),
+        );
+    }
+}
+
+struct ConsoleObservabilityConfigValidator;
+
+impl ConfigurationValidator for ConsoleObservabilityConfigValidator {
+    fn validate_block(
+        &self,
+        config: &ferron_core::config::ServerConfigurationBlock,
+        validator_ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    ) -> Result<(), ConfigurationValidationError> {
+        validate_scoped_block_flat(config, validator_ctx, "format", "logformat", Some("text"))?;
+
+        Ok(())
+    }
+}

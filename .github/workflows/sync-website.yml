@@ -1,0 +1,82 @@
+name: Sync with Ferron website (Ferron 3.x)
+
+on:
+  push:
+    branches: ["3.x"]
+    paths:
+      - "docs/**"
+      - "CHANGELOG.md"
+      - ".github/workflows/sync-website.yml"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: 3.x
+          path: ferron
+
+      - name: Checkout Ferron website
+        uses: actions/checkout@v7
+        with:
+          repository: ferronweb/ferron.sh
+          token: ${{ secrets.GIT_TOKEN }}
+          ref: main
+          path: website
+
+      - name: Determine Ferron version
+        shell: bash
+        run: |
+          FERRON_VERSION_CARGO="$(cat ferron/entrypoint/Cargo.toml | grep -E '^version' | sed -E 's|.*"([0-9a-zA-Z.+-]+)"$|\1|g')"
+          FERRON_VERSION_CHANGELOG="$(cat ferron/CHANGELOG.md | grep '^## Ferron ' | sed 's/^## Ferron //' | grep -v UNRELEASED | head -n 1)"
+          if [ "$FERRON_VERSION_CARGO" != "" ]; then
+            echo "Version determined from Cargo.toml file"
+            echo "FERRON_VERSION=$FERRON_VERSION_CARGO" >> $GITHUB_ENV
+          elif  [ "$FERRON_VERSION_CHANGELOG" != "" ]; then
+            echo "Version determined from the changelog"
+            echo "FERRON_VERSION=$FERRON_VERSION_CHANGELOG" >> $GITHUB_ENV
+          else
+            echo "Can't determine the server version!" 2>&1
+            exit 1
+          fi
+
+      - name: Sync website
+        run: |
+          # Docs
+          rm -rf website/src/content/docs/index
+          cp -r ferron/docs website/src/content/docs/index
+          cat << EOF > website/src/content/docs/index/README.md
+          # Ferron documentation
+
+          This Ferron documentation is automatically synchronized with https://github.com/ferronweb/ferron/tree/3.x.
+
+          If you want to contribute to the documentation, please open a pull request on the Ferron repository, not on the website repository.
+          EOF
+
+          # Changelog
+          cat << EOF > website/src/content/changelogs/index.md
+          ---
+          subject: Ferron 3
+          ---
+          EOF
+          cat ferron/CHANGELOG.md | grep -vE '^# ' >> website/src/content/changelogs/index.md
+
+          # Download JSON
+          cp website/src/content/downloads/v3.json v3.json
+          FERRON_VERSION="${{ env.FERRON_VERSION }}"
+          jq --arg a "$FERRON_VERSION" --arg b "$(LC_ALL=C date +'%B %-d, %Y')" '.version = $a | .releaseDate = $b' v3.json > website/src/content/downloads/v3.json
+
+          # Commit & push
+          cd website
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m 'chore: sync from https://github.com/ferronweb/ferron/tree/3.x'
+          git push origin main

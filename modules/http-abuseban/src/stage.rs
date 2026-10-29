@@ -1,0 +1,710 @@
+//! HTTP request stage for abuse ban checks.
+
+use ferron_core::pipeline::{PipelineError, Stage};
+use ferron_core::registry::StageConstraint;
+use ferron_http::abuse::{get_global_abuse_recorder, AbuseEvent, AbuseEventType};
+use ferron_http::access_log::{custom_access_log_fields, CustomAccessLogField};
+use ferron_http::span::HttpContextSpanExt;
+use ferron_http::{HttpContext, HttpResponse};
+use ferron_observability::{LogAttributeValue, TraceAttributeValue};
+use http::HeaderMap;
+use std::sync::Arc;
+
+use crate::config::parse_abuse_protection_config;
+use crate::registry::{AbuseRegistry, AbuseRegistryConfig, BanCheck};
+
+/// HTTP pipeline stage that checks for IP bans and rejects banned clients.
+pub struct AbuseProtectionStage {
+    registry: Arc<AbuseRegistry>,
+}
+
+impl AbuseProtectionStage {
+    pub fn new(registry: Arc<AbuseRegistry>) -> Self {
+        Self { registry }
+    }
+
+    #[inline]
+    async fn run_abuse_protection(&self, context: &mut HttpContext) -> Result<bool, PipelineError> {
+        let Some(config) = parse_abuse_protection_config(&context.configuration) else {
+            // No abuse protection config, skip this stage
+            return Ok(true);
+        };
+
+        context
+            .extensions
+            .insert::<AbuseRegistryConfig>(config.registry_config.clone());
+
+        let client_ip = context.remote_address.map(|a| a.ip().to_canonical());
+
+        // Without a client IP (e.g. Unix socket listeners) we cannot apply
+        // IP-based abuse bans; allow the request through.
+        let Some(client_ip) = client_ip else {
+            return Ok(true);
+        };
+
+        match self.registry.check_ban(client_ip, &config.registry_config) {
+            BanCheck::Banned { reason, remaining } => {
+                let remaining_secs = remaining.as_secs();
+
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    http::header::RETRY_AFTER,
+                    http::HeaderValue::from_str(&remaining_secs.to_string())
+                        .expect("retry-after value should be valid"),
+                );
+
+                context.res = Some(HttpResponse::BuiltinError(403, Some(headers)));
+
+                // Per-request rejection logs would spam the observability
+                // pipeline under ban waves; lifecycle transitions (triggered /
+                // expired) are logged instead. Operators debugging a specific
+                // client can opt back into per-request logs.
+                if config.log_rejections {
+                    context.events.emit(ferron_observability::Event::Log(
+                        ferron_observability::LogEvent {
+                            level: ferron_observability::LogLevel::Debug,
+                            message: format!("Ban rejection: IP {} - {}", client_ip, reason),
+                            summary: "Ban rejection".into(),
+                            target: "ferron-http-abuseban",
+                            attributes: vec![
+                                (
+                                    "client.address",
+                                    LogAttributeValue::String(client_ip.to_string()),
+                                ),
+                                (
+                                    "ferron.abuseban.reason",
+                                    LogAttributeValue::String(reason.clone()),
+                                ),
+                                (
+                                    "ferron.abuseban.remaining_secs",
+                                    LogAttributeValue::I64(remaining_secs as i64),
+                                ),
+                            ],
+                            trace_context: ferron_http::trace_context::current_event_trace_context(
+                                context,
+                            ),
+                        },
+                    ));
+                }
+
+                context.events.emit(ferron_observability::Event::Metric(
+                    ferron_observability::MetricEvent {
+                        name: "ferron.abuseban.rejected",
+                        attributes: vec![(
+                            "ferron.abuseban.reason",
+                            ferron_observability::MetricAttributeValue::String(reason.clone()),
+                        )],
+                        ty: ferron_observability::MetricType::Counter,
+                        value: ferron_observability::MetricValue::U64(1),
+                        unit: Some("{request}"),
+                        description: Some("Requests rejected due to IP ban."),
+                        trace_context: ferron_http::trace_context::current_event_trace_context(
+                            context,
+                        ),
+                    },
+                ));
+
+                {
+                    let sa = context.get_span_attributes();
+                    sa.insert(
+                        "ferron.abuseban.action",
+                        TraceAttributeValue::String("rejected".to_string()),
+                    );
+                    sa.insert(
+                        "ferron.abuseban.reason",
+                        TraceAttributeValue::String(reason.clone()),
+                    );
+                    sa.insert(
+                        "ferron.abuseban.remaining_secs",
+                        TraceAttributeValue::I64(remaining_secs as i64),
+                    );
+                    sa.insert(
+                        "error.type",
+                        TraceAttributeValue::String("ip_banned".to_string()),
+                    );
+                    let log_fields = custom_access_log_fields(context);
+                    log_fields.insert(
+                        "ferron.abuseban.action".into(),
+                        CustomAccessLogField::String("rejected".into()),
+                    );
+                    log_fields.insert(
+                        "ferron.abuseban.reason".into(),
+                        CustomAccessLogField::String(reason),
+                    );
+                    log_fields.insert(
+                        "ferron.abuseban.remaining_secs".into(),
+                        CustomAccessLogField::U64(remaining_secs),
+                    );
+                }
+                return Ok(false);
+            }
+            BanCheck::Expired { reason } => {
+                // Only the first observer of an expiry sees this variant, so
+                // the transition is logged exactly once per ban lifecycle.
+                crate::registry::emit_ban_expired(
+                    context,
+                    client_ip,
+                    &reason,
+                    self.registry.active_ban_count(),
+                );
+            }
+            BanCheck::Clean => {}
+        }
+
+        {
+            let sa = context.get_span_attributes();
+            sa.insert(
+                "ferron.abuseban.action",
+                TraceAttributeValue::String("skip".to_string()),
+            );
+            let log_fields = custom_access_log_fields(context);
+            log_fields.insert(
+                "ferron.abuseban.action".into(),
+                CustomAccessLogField::String("skip".into()),
+            );
+        }
+        Ok(true)
+    }
+
+    #[inline]
+    async fn run_abuse_event(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        let Some(abuse_event_type) = ctx
+            .configuration
+            .get_value("abuse_event", true)
+            .and_then(|v| v.as_str())
+        else {
+            return Ok(true);
+        };
+
+        if let (Some(recorder), Some(ip)) = (
+            get_global_abuse_recorder(),
+            ctx.remote_address.map(|a| a.ip()),
+        ) {
+            let abuse_event = AbuseEvent::new(
+                AbuseEventType::Custom,
+                ip,
+                format!("Custom abuse event: {abuse_event_type}"),
+                40,
+            );
+            recorder.record_event(&abuse_event, ctx);
+        }
+
+        Ok(true)
+    }
+
+    #[inline]
+    async fn run_error_rate_check(&self, ctx: &mut HttpContext) -> Result<(), PipelineError> {
+        let config = match ctx.extensions.get::<AbuseRegistryConfig>() {
+            Some(config) => config.clone(),
+            None => return Ok(()),
+        };
+
+        if config.error_rate_thresholds.is_empty() {
+            return Ok(());
+        }
+
+        let status_code = match &ctx.res {
+            Some(HttpResponse::Custom(response)) => response.status().as_u16(),
+            Some(HttpResponse::BuiltinError(status, _)) => *status,
+            None => 404, // implicit 404 when no response is set
+            _ => return Ok(()),
+        };
+
+        let matches_any = config
+            .error_rate_thresholds
+            .iter()
+            .any(|t| t.status_codes.contains(&status_code));
+
+        if !matches_any {
+            return Ok(());
+        }
+
+        if let (Some(recorder), Some(ip)) = (
+            get_global_abuse_recorder(),
+            ctx.remote_address.map(|a| a.ip()),
+        ) {
+            let abuse_event = AbuseEvent::with_status_code(
+                AbuseEventType::ErrorRate,
+                ip,
+                format!("Error rate: {status_code} responses"),
+                40,
+                status_code,
+            );
+            recorder.record_event(&abuse_event, ctx);
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Stage<HttpContext> for AbuseProtectionStage {
+    fn name(&self) -> &str {
+        "abuse_protection"
+    }
+
+    fn constraints(&self) -> Vec<StageConstraint> {
+        // Run early, after client IP is resolved but before rate limiting
+        vec![
+            StageConstraint::After("client_ip_from_header".to_string()),
+            StageConstraint::Before("cache".to_string()),
+            StageConstraint::Before("rate_limit".to_string()),
+            StageConstraint::Before("basicauth".to_string()),
+        ]
+    }
+
+    fn is_applicable(
+        &self,
+        config: Option<&ferron_core::config::ServerConfigurationBlock>,
+    ) -> bool {
+        config
+            .is_some_and(|c| c.has_directive("abuse_protection") || c.has_directive("abuse_event"))
+    }
+
+    async fn run(&self, context: &mut HttpContext) -> Result<bool, PipelineError> {
+        let to_continue = self.run_abuse_protection(context).await?;
+        if to_continue {
+            self.run_abuse_event(context).await
+        } else {
+            Ok(to_continue)
+        }
+    }
+
+    async fn run_inverse(&self, ctx: &mut HttpContext) -> Result<(), PipelineError> {
+        self.run_error_rate_check(ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustc_hash::FxHashMap;
+    use std::net::SocketAddr;
+
+    use bytes::Bytes;
+    use ferron_core::config::layer::LayeredConfiguration;
+    use ferron_core::config::{ServerConfigurationBlock, ServerConfigurationDirectiveEntry};
+    use ferron_http::HttpRequest;
+    use ferron_observability::CompositeEventSink;
+    use http::Request;
+    use http_body_util::{BodyExt, Empty};
+
+    use crate::registry::{AbuseRegistry, AbuseRegistryConfig, EventThreshold};
+    use ferron_http::abuse::{AbuseEvent, AbuseEventType};
+    use ferron_observability::{Event, EventSink};
+
+    fn make_context(remote_addr: SocketAddr, config: LayeredConfiguration) -> HttpContext {
+        let req: HttpRequest = Request::builder()
+            .uri("/test")
+            .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync())
+            .unwrap();
+
+        let mut ctx = HttpContext::default();
+        ctx.req = Some(req);
+        ctx.events = CompositeEventSink::new(Vec::new());
+        ctx.configuration = config;
+        ctx.hostname = Some("example.com".to_string());
+        ctx.encrypted = false;
+        ctx.local_address = Some("0.0.0.0:80".parse().unwrap());
+        ctx.remote_address = Some(remote_addr);
+        ctx
+    }
+
+    fn make_config_with_abuse() -> LayeredConfiguration {
+        let inner = FxHashMap::default();
+        let mut outer = FxHashMap::default();
+        outer.insert(
+            "abuse_protection".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![],
+                children: Some(ServerConfigurationBlock {
+                    directives: Arc::new(inner),
+                    matchers: FxHashMap::default(),
+                    span: None,
+                }),
+                span: None,
+            }],
+        );
+
+        let mut config = LayeredConfiguration::new();
+        config.add_layer(Arc::new(ServerConfigurationBlock {
+            directives: Arc::new(outer),
+            matchers: FxHashMap::default(),
+            span: None,
+        }));
+        config
+    }
+
+    #[tokio::test]
+    async fn allows_request_when_not_banned() {
+        let registry = Arc::new(AbuseRegistry::new());
+        let stage = AbuseProtectionStage::new(registry);
+
+        let config = make_config_with_abuse();
+        let addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+        let mut ctx = make_context(addr, config);
+
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(result, "non-banned IP should pass through");
+        assert!(ctx.res.is_none(), "no response should be set");
+    }
+
+    #[tokio::test]
+    async fn rejects_banned_ip_with_403() {
+        let registry_config = AbuseRegistryConfig {
+            enabled: true,
+            ban_duration_secs: 60,
+            thresholds: vec![EventThreshold::new(
+                AbuseEventType::RateLimitExceeded,
+                1,
+                10,
+            )],
+            error_rate_thresholds: Vec::new(),
+            allowlist: Vec::new(),
+        };
+        let registry = Arc::new(AbuseRegistry::new());
+        let stage = AbuseProtectionStage::new(registry.clone());
+
+        let addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+        let event = AbuseEvent::new(
+            AbuseEventType::RateLimitExceeded,
+            addr.ip(),
+            "Test ban".into(),
+            50,
+        );
+        registry.record_event(&event, &registry_config);
+
+        let config = make_config_with_abuse();
+        let mut ctx = make_context(addr, config);
+
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(!result, "banned IP should be rejected");
+        assert!(ctx.res.is_some(), "response should be set");
+
+        if let Some(ferron_http::HttpResponse::BuiltinError(status, _)) = &ctx.res {
+            assert_eq!(*status, 403, "should return 403");
+        } else {
+            panic!("expected BuiltinError(403, _)");
+        }
+    }
+
+    #[tokio::test]
+    async fn includes_retry_after_header() {
+        let registry_config = AbuseRegistryConfig {
+            enabled: true,
+            ban_duration_secs: 3600,
+            thresholds: vec![EventThreshold::new(
+                AbuseEventType::RateLimitExceeded,
+                1,
+                10,
+            )],
+            error_rate_thresholds: Vec::new(),
+            allowlist: Vec::new(),
+        };
+        let registry = Arc::new(AbuseRegistry::new());
+        let stage = AbuseProtectionStage::new(registry.clone());
+
+        let addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+        let event = AbuseEvent::new(
+            AbuseEventType::RateLimitExceeded,
+            addr.ip(),
+            "Retry-After test".into(),
+            50,
+        );
+        registry.record_event(&event, &registry_config);
+
+        let config = make_config_with_abuse();
+        let mut ctx = make_context(addr, config);
+
+        stage.run(&mut ctx).await.unwrap();
+
+        if let Some(ferron_http::HttpResponse::BuiltinError(_, headers)) = &ctx.res {
+            assert!(headers.is_some(), "should have headers");
+            let headers = headers.as_ref().unwrap();
+            let retry_after = headers.get(http::header::RETRY_AFTER);
+            assert!(retry_after.is_some(), "should have Retry-After header");
+            let value = retry_after.unwrap().to_str().unwrap();
+            let secs: u64 = value.parse().unwrap();
+            assert!(secs > 0, "Retry-After should be positive");
+        } else {
+            panic!("expected BuiltinError with headers");
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_ips_independent() {
+        let registry_config = AbuseRegistryConfig {
+            enabled: true,
+            ban_duration_secs: 60,
+            thresholds: vec![EventThreshold::new(
+                AbuseEventType::RateLimitExceeded,
+                1,
+                10,
+            )],
+            error_rate_thresholds: Vec::new(),
+            allowlist: Vec::new(),
+        };
+        let registry = Arc::new(AbuseRegistry::new());
+        let stage = AbuseProtectionStage::new(registry.clone());
+
+        let banned_addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+        let allowed_addr: SocketAddr = "192.0.2.2:12345".parse().unwrap();
+
+        let event = AbuseEvent::new(
+            AbuseEventType::RateLimitExceeded,
+            banned_addr.ip(),
+            "Ban this".into(),
+            50,
+        );
+        registry.record_event(&event, &registry_config);
+
+        let config = make_config_with_abuse();
+
+        // Banned IP rejected
+        let mut ctx1 = make_context(banned_addr, config.clone());
+        let first_result = stage.run(&mut ctx1).await.unwrap();
+        assert!(!first_result);
+
+        let mut ctx2 = make_context(allowed_addr, config);
+        let second_result = stage.run(&mut ctx2).await.unwrap();
+        assert!(second_result);
+    }
+
+    #[tokio::test]
+    async fn run_inverse_records_error_rate_event() {
+        let registry = Arc::new(AbuseRegistry::new());
+        let stage = AbuseProtectionStage::new(registry.clone());
+
+        let config = AbuseRegistryConfig {
+            enabled: true,
+            ban_duration_secs: 60,
+            thresholds: vec![],
+            error_rate_thresholds: vec![crate::registry::ErrorRateThresholdConfig::new(
+                2,
+                60,
+                vec![404],
+            )],
+            allowlist: Vec::new(),
+        };
+
+        let addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+        let mut ctx = make_context(addr, make_config_with_abuse());
+        ctx.extensions.insert::<AbuseRegistryConfig>(config.clone());
+        ctx.res = Some(ferron_http::HttpResponse::BuiltinError(404, None));
+
+        // Without global recorder, run_inverse should not panic and should not record events
+        stage.run_inverse(&mut ctx).await.unwrap();
+        assert!(
+            !registry.is_banned(addr.ip(), &config),
+            "should not be banned without global recorder"
+        );
+
+        // But the registry's record_error_rate_event should work directly
+        let event = ferron_http::abuse::AbuseEvent::with_status_code(
+            ferron_http::abuse::AbuseEventType::ErrorRate,
+            addr.ip(),
+            "Error rate: 404 responses".into(),
+            40,
+            404,
+        );
+        assert_eq!(
+            registry.record_event(&event, &config),
+            ferron_http::abuse::EventResult::Recorded
+        );
+        assert_eq!(
+            registry.record_event(&event, &config),
+            ferron_http::abuse::EventResult::BanTriggered
+        );
+        assert!(registry.is_banned(addr.ip(), &config));
+    }
+
+    #[tokio::test]
+    async fn run_inverse_ignores_non_matching_status_code() {
+        let registry = Arc::new(AbuseRegistry::new());
+        let stage = AbuseProtectionStage::new(registry.clone());
+
+        let config = AbuseRegistryConfig {
+            enabled: true,
+            ban_duration_secs: 60,
+            thresholds: vec![],
+            error_rate_thresholds: vec![crate::registry::ErrorRateThresholdConfig::new(
+                2,
+                60,
+                vec![404],
+            )],
+            allowlist: Vec::new(),
+        };
+
+        let addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+        let mut ctx = make_context(addr, make_config_with_abuse());
+        ctx.extensions.insert::<AbuseRegistryConfig>(config.clone());
+        ctx.res = Some(ferron_http::HttpResponse::BuiltinError(200, None));
+
+        for _ in 0..5 {
+            stage.run_inverse(&mut ctx).await.unwrap();
+        }
+
+        assert!(
+            !registry.is_banned(addr.ip(), &config),
+            "should not be banned for non-matching status codes"
+        );
+    }
+
+    /// Test sink that records every event for assertions.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: std::sync::Mutex<Vec<Event>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: Event) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn log_summaries(recorder: &RecordingSink) -> Vec<String> {
+        recorder
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Log(log) => Some(log.summary.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ban_test_addr(registry: &AbuseRegistry, ban_duration_secs: u64) -> SocketAddr {
+        let registry_config = AbuseRegistryConfig {
+            enabled: true,
+            ban_duration_secs,
+            thresholds: vec![EventThreshold::new(
+                AbuseEventType::RateLimitExceeded,
+                1,
+                10,
+            )],
+            error_rate_thresholds: Vec::new(),
+            allowlist: Vec::new(),
+        };
+        let addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+        let event = AbuseEvent::new(
+            AbuseEventType::RateLimitExceeded,
+            addr.ip(),
+            "Test ban".into(),
+            50,
+        );
+        registry.record_event(&event, &registry_config);
+        addr
+    }
+
+    fn make_config_with_log_rejections() -> LayeredConfiguration {
+        let mut inner = FxHashMap::default();
+        inner.insert(
+            "log_rejections".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![],
+                children: None,
+                span: None,
+            }],
+        );
+        let mut outer = FxHashMap::default();
+        outer.insert(
+            "abuse_protection".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![],
+                children: Some(ServerConfigurationBlock {
+                    directives: Arc::new(inner),
+                    matchers: FxHashMap::default(),
+                    span: None,
+                }),
+                span: None,
+            }],
+        );
+
+        let mut config = LayeredConfiguration::new();
+        config.add_layer(Arc::new(ServerConfigurationBlock {
+            directives: Arc::new(outer),
+            matchers: FxHashMap::default(),
+            span: None,
+        }));
+        config
+    }
+
+    #[tokio::test]
+    async fn banned_ip_rejection_emits_no_log_by_default() {
+        let registry = Arc::new(AbuseRegistry::new());
+        let stage = AbuseProtectionStage::new(registry.clone());
+        let addr = ban_test_addr(&registry, 60);
+
+        let recorder = Arc::new(RecordingSink::default());
+        let mut ctx = make_context(addr, make_config_with_abuse());
+        ctx.events = CompositeEventSink::new(vec![recorder.clone()]);
+
+        assert!(!stage.run(&mut ctx).await.unwrap());
+        assert!(matches!(
+            ctx.res,
+            Some(ferron_http::HttpResponse::BuiltinError(403, _))
+        ));
+        assert!(
+            !log_summaries(&recorder).contains(&"Ban rejection".to_string()),
+            "per-request ban rejection must not be logged by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn banned_ip_rejection_logs_when_opted_in() {
+        let registry = Arc::new(AbuseRegistry::new());
+        let stage = AbuseProtectionStage::new(registry.clone());
+        let addr = ban_test_addr(&registry, 60);
+
+        let recorder = Arc::new(RecordingSink::default());
+        let mut ctx = make_context(addr, make_config_with_log_rejections());
+        ctx.events = CompositeEventSink::new(vec![recorder.clone()]);
+
+        assert!(!stage.run(&mut ctx).await.unwrap());
+        assert_eq!(
+            log_summaries(&recorder)
+                .iter()
+                .filter(|summary| *summary == "Ban rejection")
+                .count(),
+            1,
+            "opted-in per-request ban rejection must be logged once"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_ban_logs_transition_once_and_allows_request() {
+        let registry = Arc::new(AbuseRegistry::new());
+        let stage = AbuseProtectionStage::new(registry.clone());
+        let addr = ban_test_addr(&registry, 0);
+
+        let recorder = Arc::new(RecordingSink::default());
+        let mut ctx = make_context(addr, make_config_with_abuse());
+        ctx.events = CompositeEventSink::new(vec![recorder.clone()]);
+
+        // Expired bans no longer block the request...
+        assert!(stage.run(&mut ctx).await.unwrap());
+        assert!(ctx.res.is_none());
+        // ...and the expiry transition is logged exactly once.
+        assert_eq!(
+            log_summaries(&recorder)
+                .iter()
+                .filter(|summary| *summary == "Ban expired")
+                .count(),
+            1
+        );
+
+        let mut ctx = make_context(addr, make_config_with_abuse());
+        ctx.events = CompositeEventSink::new(vec![recorder.clone()]);
+        assert!(stage.run(&mut ctx).await.unwrap());
+        assert_eq!(
+            log_summaries(&recorder)
+                .iter()
+                .filter(|summary| *summary == "Ban expired")
+                .count(),
+            1,
+            "a second observation must not re-log the expiry"
+        );
+    }
+}

@@ -1,0 +1,159 @@
+[package]
+name = "e2e"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31.2", features = ["fs"] }
+
+[build-dependencies]
+prost-build = "0.14"
+
+[[test]]
+name = "abort"
+path = "tests/abort.rs"
+
+[[test]]
+name = "acme"
+path = "tests/acme.rs"
+
+[[test]]
+name = "auth"
+path = "tests/auth/mod.rs"
+
+[[test]]
+name = "buffer"
+path = "tests/buffer.rs"
+
+[[test]]
+name = "cache"
+path = "tests/cache/mod.rs"
+
+[[test]]
+name = "canary"
+path = "tests/canary.rs"
+
+[[test]]
+name = "cgi"
+path = "tests/cgi.rs"
+
+[[test]]
+name = "config"
+path = "tests/config/mod.rs"
+
+[[test]]
+name = "cors"
+path = "tests/cors.rs"
+
+[[test]]
+name = "dcompress"
+path = "tests/dcompress.rs"
+
+[[test]]
+name = "early_hints"
+path = "tests/early_hints.rs"
+
+[[test]]
+name = "error"
+path = "tests/error/mod.rs"
+
+[[test]]
+name = "fcgi"
+path = "tests/fcgi.rs"
+
+[[test]]
+name = "fproxy"
+path = "tests/fproxy.rs"
+
+[[test]]
+name = "grpc"
+path = "tests/grpc/mod.rs"
+
+[[test]]
+name = "http"
+path = "tests/http/mod.rs"
+
+[[test]]
+name = "log_interpolation"
+path = "tests/log_interpolation.rs"
+
+[[test]]
+name = "log_rotation"
+path = "tests/log_rotation.rs"
+
+[[test]]
+name = "observability"
+path = "tests/observability/mod.rs"
+
+[[test]]
+name = "ocsp"
+path = "tests/ocsp.rs"
+
+[[test]]
+name = "proxy"
+path = "tests/proxy/mod.rs"
+
+[[test]]
+name = "proxy_protocol"
+path = "tests/proxy_protocol.rs"
+
+[[test]]
+name = "reload"
+path = "tests/reload.rs"
+
+[[test]]
+name = "response"
+path = "tests/response/mod.rs"
+
+[[test]]
+name = "security"
+path = "tests/security/mod.rs"
+
+[[test]]
+name = "static"
+path = "tests/static.rs"
+
+[[test]]
+name = "timeout"
+path = "tests/timeout.rs"
+
+[[test]]
+name = "tls"
+path = "tests/tls/mod.rs"
+
+[[test]]
+name = "unix"
+path = "tests/unix.rs"
+
+[dev-dependencies]
+aes = "0.9"
+brotli = "9.0.0"
+cbc = "0.2"
+flate2 = "1.1.9"
+futures-util = "0.3.31"
+getrandom = "0.4"
+glob = "0.3.3"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+hmac = "0.13"
+http = "1.4.0"
+password-auth = "1.0.0"
+prost = "0.14"
+quinn = "0.11.9"
+rasn = "0.29"
+rasn-ocsp = "0.29"
+rcgen = "0.14.7"
+reqwest = { version = "0.13.2", default-features = false, features = ["http2", "rustls-no-provider", "cookies"] }
+rustls = { version = "0.23.37", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pki-types = "1.14.0"
+serde_json = "1.0.149"
+sha1 = "0.11"
+sha2 = "0.11"
+tempfile = "3.27.0"
+testcontainers = { version = "0.28.0", features = ["http_wait_plain", "reusable-containers"] }
+tokio = { version = "1.50.0", features = ["full"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = "0.30.0"
+x509-parser = "0.18.0"
+zstd = "0.14.0"

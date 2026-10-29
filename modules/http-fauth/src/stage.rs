@@ -1,0 +1,422 @@
+//! Forwarded authentication pipeline stage.
+
+use std::sync::Arc;
+
+use ferron_core::pipeline::{PipelineError, Stage};
+use ferron_core::registry::StageConstraint;
+use ferron_http::access_log::{custom_access_log_fields, CustomAccessLogField};
+use ferron_http::client_ip::ClientIpFromHeaderConfig;
+use ferron_http::span::HttpContextSpanExt;
+use ferron_http::HttpContext;
+use ferron_observability::{Event, LogAttributeValue, LogEvent, LogLevel, TraceAttributeValue};
+use http::Request;
+use http_body_util::{BodyExt, Empty};
+
+use crate::client::ForwardedAuthClient;
+use crate::config::{parse_forwarded_auth_from_context, ForwardedAuthConfig};
+use crate::{ConnpoolKey, ProxyBody};
+
+/// Pipeline stage that handles forwarded authentication.
+pub struct ForwardedAuthenticationStage {
+    /// Shared HTTP client for authentication requests.
+    client: Arc<ForwardedAuthClient>,
+}
+
+impl ForwardedAuthenticationStage {
+    /// Create a new forwarded authentication stage.
+    pub fn new(client: Arc<ForwardedAuthClient>) -> Self {
+        Self { client }
+    }
+
+    fn client_ip_from_header_enabled(ctx: &HttpContext) -> bool {
+        ClientIpFromHeaderConfig::resolve_from_context(ctx).is_some_and(|s| {
+            ctx.remote_address
+                .is_some_and(|a| s.is_trusted_proxy(a.ip()))
+        })
+    }
+
+    fn set_x_forwarded_for(headers: &mut http::HeaderMap, client_ip_str: &str) {
+        if let Ok(hv) = http::HeaderValue::from_str(client_ip_str) {
+            headers.insert("x-forwarded-for", hv);
+        }
+    }
+
+    fn append_x_forwarded_for(headers: &mut http::HeaderMap, client_ip_str: &str) {
+        if let Some(existing) = headers.get("x-forwarded-for") {
+            if let Ok(existing_str) = existing.to_str() {
+                let new_value = format!("{}, {}", existing_str, client_ip_str);
+                if let Ok(hv) = http::HeaderValue::from_str(&new_value) {
+                    headers.insert("x-forwarded-for", hv);
+                    return;
+                }
+            }
+        }
+        if let Ok(hv) = http::HeaderValue::from_str(client_ip_str) {
+            headers.insert("x-forwarded-for", hv);
+        }
+    }
+
+    fn set_forwarded(
+        headers: &mut http::HeaderMap,
+        client_ip_str: &str,
+        proto: &'static str,
+        local_ip_str: &str,
+    ) {
+        let element = Self::build_forwarded_element(client_ip_str, proto, local_ip_str);
+        if let Ok(hv) = http::HeaderValue::from_str(&element) {
+            headers.insert("forwarded", hv);
+        }
+    }
+
+    fn append_forwarded(
+        headers: &mut http::HeaderMap,
+        client_ip_str: &str,
+        proto: &'static str,
+        local_ip_str: &str,
+    ) {
+        let element = Self::build_forwarded_element(client_ip_str, proto, local_ip_str);
+        if let Some(existing) = headers.get("forwarded") {
+            if let Ok(existing_str) = existing.to_str() {
+                let new_value = format!("{}, {}", existing_str, element);
+                if let Ok(hv) = http::HeaderValue::from_str(&new_value) {
+                    headers.insert("forwarded", hv);
+                    return;
+                }
+            }
+        }
+        if let Ok(hv) = http::HeaderValue::from_str(&element) {
+            headers.insert("forwarded", hv);
+        }
+    }
+
+    fn build_forwarded_element(client_ip_str: &str, proto: &str, local_ip_str: &str) -> String {
+        // Detect IPv6 from the pre-formatted string
+        let for_value = if client_ip_str.contains(':') {
+            format!("\"[{}]\"", client_ip_str)
+        } else {
+            client_ip_str.to_string()
+        };
+        let by_value = if local_ip_str.contains(':') {
+            format!("\"[{}]\"", local_ip_str)
+        } else {
+            local_ip_str.to_string()
+        };
+        format!("for={};proto={};by={}", for_value, proto, by_value)
+    }
+
+    /// Build the authentication request to send to the backend.
+    fn build_auth_request(
+        &self,
+        ctx: &HttpContext,
+        config: &ForwardedAuthConfig,
+    ) -> Result<Request<ProxyBody>, Box<dyn std::error::Error>> {
+        let original_request = ctx.req.as_ref().ok_or("No request in context")?;
+
+        let path = original_request.uri().path();
+        let query = original_request
+            .uri()
+            .query()
+            .map(|q| format!("?{}", q))
+            .unwrap_or_default();
+        let auth_uri = if !config.append_uri {
+            config.backend_url.clone()
+        } else {
+            format!("{}{}{}", config.backend_url, path, query)
+        };
+
+        let mut auth_request = Request::builder()
+            .uri(auth_uri)
+            .method(original_request.method().clone());
+
+        // Copy headers from original request to auth request
+        let Some(headers) = auth_request.headers_mut() else {
+            return Err("Failed to get headers for auth request".into());
+        };
+        for (name, value) in original_request.headers() {
+            headers.insert(name.clone(), value.clone());
+        }
+
+        // Apply request_header transformations (add/replace/remove) before
+        // Ferron injects its own forwarding headers, so a user-configured
+        // request_header can still override an auto-injected header below.
+        for name in &config.headers_to_remove {
+            headers.remove(name);
+        }
+        for (name, value) in &config.headers_to_replace {
+            headers.insert(name.clone(), http::HeaderValue::from_str(value)?);
+        }
+        for action in &config.headers_to_add {
+            let (name, value) = action;
+            headers.append(name.clone(), http::HeaderValue::from_str(value)?);
+        }
+
+        let client_ip = ctx.remote_address.map(|a| a.ip());
+        let local_ip = ctx.local_address.map(|a| a.ip());
+        let proto = if ctx.encrypted { "https" } else { "http" };
+        // Only inject forwarded headers when both local and remote addresses
+        // are known (not the case for Unix socket listeners).
+        if let (Some(client_ip), Some(local_ip)) = (client_ip, local_ip) {
+            let client_ip_str = client_ip.to_string();
+            let local_ip_str = local_ip.to_string();
+            if Self::client_ip_from_header_enabled(ctx) {
+                Self::append_x_forwarded_for(headers, &client_ip_str);
+                Self::append_forwarded(headers, &client_ip_str, proto, &local_ip_str);
+            } else {
+                Self::set_x_forwarded_for(headers, &client_ip_str);
+                Self::set_forwarded(headers, &client_ip_str, proto, &local_ip_str);
+            }
+            headers.insert(
+                http::HeaderName::from_static("x-real-ip"),
+                http::HeaderValue::from_str(&client_ip_str)?,
+            );
+        }
+        headers.insert(
+            http::header::HeaderName::from_static("x-forwarded-proto"),
+            http::header::HeaderValue::from_static(proto),
+        );
+        headers.insert(
+            http::header::HeaderName::from_static("x-forwarded-uri"),
+            http::header::HeaderValue::from_str(&format!("{}{}", path, query))?,
+        );
+        headers.insert(
+            http::header::HeaderName::from_static("x-forwarded-method"),
+            http::header::HeaderValue::from_str(original_request.method().as_str())?,
+        );
+
+        // Remove upgrade headers (no HTTP upgrades for auth requests)
+        headers.remove(http::header::UPGRADE);
+        headers.remove(http::header::CONNECTION);
+        headers.insert(
+            http::header::CONNECTION,
+            http::header::HeaderValue::from_static("keep-alive"),
+        );
+
+        Ok(auth_request.body(
+            Empty::<bytes::Bytes>::new()
+                .map_err(|e| match e {})
+                .boxed_unsync(),
+        )?)
+    }
+
+    /// Send the authentication request and handle the response.
+    async fn send_auth_request(
+        &self,
+        ctx: &mut HttpContext,
+        config: &ForwardedAuthConfig,
+    ) -> Result<bool, PipelineError> {
+        let auth_request = match self.build_auth_request(ctx, config) {
+            Ok(req) => req,
+            Err(e) => {
+                ctx.events.emit(Event::Log(LogEvent {
+                    level: LogLevel::Error,
+                    message: format!("fauth: failed to build auth request: {}", e),
+                    summary: "Forwarded auth failed to build request".into(),
+                    target: "ferron-http-fauth",
+                    attributes: vec![("error.message", LogAttributeValue::String(e.to_string()))],
+                    trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+                }));
+                ctx.res = Some(ferron_http::HttpResponse::BuiltinError(500, None));
+                return Ok(false);
+            }
+        };
+
+        let pool_key = ConnpoolKey {
+            url: config.backend_url.clone(),
+            unix_socket: config.unix_socket.clone(),
+        };
+
+        if let Some(limit) = config.connection_limit {
+            self.client.set_local_limit(&pool_key.url, limit).await;
+        }
+        let local_limit = self.client.get_local_limit(&pool_key.url).await;
+
+        let mut conn_item = match self
+            .client
+            .get_connection(&pool_key, config.no_verification, local_limit)
+            .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                ctx.events.emit(Event::Log(LogEvent {
+                    level: LogLevel::Error,
+                    message: format!("fauth: failed to get connection: {}", e),
+                    summary: "Forwarded auth failed to get connection".into(),
+                    target: "ferron-http-fauth",
+                    attributes: vec![("error.message", LogAttributeValue::String(e.to_string()))],
+                    trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+                }));
+                ctx.res = Some(ferron_http::HttpResponse::BuiltinError(500, None));
+                return Ok(false);
+            }
+        };
+
+        let auth_response = match conn_item
+            .inner_mut()
+            .as_mut()
+            .expect("connection is guaranteed to be available")
+            .client
+            .send_request(auth_request)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                ctx.events.emit(Event::Log(LogEvent {
+                    level: LogLevel::Error,
+                    message: format!("fauth: auth request failed: {}", e),
+                    summary: "Forwarded auth request failed".into(),
+                    target: "ferron-http-fauth",
+                    attributes: vec![("error.message", LogAttributeValue::String(e.to_string()))],
+                    trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+                }));
+                self.client.return_connection(pool_key, conn_item);
+                ctx.res = Some(ferron_http::HttpResponse::BuiltinError(500, None));
+                return Ok(false);
+            }
+        };
+
+        // Check if authentication was successful
+        if auth_response.status().is_success() {
+            if !config.copy_headers.is_empty() {
+                let original_request = ctx
+                    .req
+                    .as_mut()
+                    .ok_or(PipelineError::custom("No request in context"))?;
+                let auth_headers = auth_response.headers();
+                let request_headers = original_request.headers_mut();
+
+                for header_name in &config.copy_headers {
+                    if auth_headers.contains_key(header_name) {
+                        while request_headers.remove(header_name).is_some() {}
+                        // Copy all values from auth response
+                        for header_value in auth_headers.get_all(header_name) {
+                            request_headers.append(header_name.clone(), header_value.clone());
+                        }
+                    }
+                }
+            }
+
+            self.client.return_connection(pool_key, conn_item);
+
+            ctx.events.emit(Event::Log(LogEvent {
+                level: LogLevel::Debug,
+                message: "fauth: authentication successful".to_string(),
+                summary: "Forwarded auth succeeded".into(),
+                target: "ferron-http-fauth",
+                attributes: Vec::new(),
+                trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+            }));
+
+            ctx.get_span_attributes().insert(
+                "ferron.fauth.result",
+                TraceAttributeValue::StaticStr("success"),
+            );
+            ctx.get_span_attributes().insert(
+                "ferron.fauth.backend_url",
+                TraceAttributeValue::String(config.backend_url.clone()),
+            );
+            let log_fields = custom_access_log_fields(ctx);
+            log_fields.insert(
+                "ferron.fauth.result".into(),
+                CustomAccessLogField::String("success".into()),
+            );
+            log_fields.insert(
+                "ferron.fauth.backend_url".into(),
+                CustomAccessLogField::String(config.backend_url.clone()),
+            );
+            Ok(true)
+        } else {
+            let auth_status = auth_response.status();
+            // Authentication failed - return the auth response as the final response
+            if config.intercept_errors {
+                ctx.res = Some(ferron_http::HttpResponse::BuiltinError(
+                    auth_status.as_u16(),
+                    None,
+                ));
+            } else {
+                ctx.res = Some(ferron_http::HttpResponse::Custom(
+                    auth_response.map(|body| body.map_err(std::io::Error::other).boxed_unsync()),
+                ));
+            }
+
+            self.client.return_connection(pool_key, conn_item);
+
+            ctx.events.emit(Event::Log(LogEvent {
+                level: LogLevel::Info,
+                message: format!("fauth: authentication failed with status {}", auth_status),
+                summary: "Forwarded auth failed".into(),
+                target: "ferron-http-fauth",
+                attributes: vec![(
+                    "http.response.status_code",
+                    LogAttributeValue::I64(auth_status.as_u16() as i64),
+                )],
+                trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+            }));
+
+            ctx.get_span_attributes().insert(
+                "ferron.fauth.result",
+                TraceAttributeValue::StaticStr("failure"),
+            );
+            ctx.get_span_attributes().insert(
+                "http.response.status_code",
+                TraceAttributeValue::I64(auth_status.as_u16() as i64),
+            );
+            ctx.get_span_attributes()
+                .insert("error.type", TraceAttributeValue::StaticStr("auth_failed"));
+            custom_access_log_fields(ctx).insert(
+                "ferron.fauth.result".into(),
+                CustomAccessLogField::String("failure".into()),
+            );
+
+            Ok(false)
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Stage<HttpContext> for ForwardedAuthenticationStage {
+    fn name(&self) -> &str {
+        "forwarded_auth"
+    }
+
+    fn constraints(&self) -> Vec<StageConstraint> {
+        vec![
+            StageConstraint::Before("reverse_proxy".to_string()),
+            StageConstraint::Before("forward_proxy".to_string()),
+            StageConstraint::After("cache".to_string()),
+            StageConstraint::After("basicauth".to_string()),
+        ]
+    }
+
+    fn is_applicable(
+        &self,
+        config: Option<&ferron_core::config::ServerConfigurationBlock>,
+    ) -> bool {
+        config.is_some_and(|c| c.has_directive("auth_to"))
+    }
+
+    async fn run(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        let configs = match parse_forwarded_auth_from_context(ctx) {
+            Ok(cfgs) if cfgs.is_empty() => return Ok(true), // No forwarded auth configured
+            Ok(cfgs) => cfgs,
+            Err(e) => {
+                ctx.events.emit(Event::Log(LogEvent {
+                    level: LogLevel::Error,
+                    message: format!("fauth: configuration error: {}", e),
+                    summary: "Forwarded auth configuration error".into(),
+                    target: "ferron-http-fauth",
+                    attributes: vec![("error.message", LogAttributeValue::String(e.to_string()))],
+                    trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+                }));
+                ctx.res = Some(ferron_http::HttpResponse::BuiltinError(500, None));
+                return Ok(false);
+            }
+        };
+
+        for config in &configs {
+            if !self.send_auth_request(ctx, config).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}

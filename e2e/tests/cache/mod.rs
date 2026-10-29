@@ -1,0 +1,1845 @@
+#[cfg(unix)]
+use std::{io::Write, path::Path};
+
+use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt, TestcontainersError,
+    core::{ContainerPort, Mount, WaitFor, wait::HttpWaitStrategy},
+    runners::AsyncRunner,
+};
+
+#[path = "../common/mod.rs"]
+mod common;
+
+mod lscache;
+mod persistence;
+mod zones;
+
+async fn create_ferron_container(
+    webroot_dir: &Path,
+    config_file: &Path,
+) -> Result<ContainerAsync<GenericImage>, TestcontainersError> {
+    let ferron_image = self::common::build_ferron_image().await?;
+    ferron_image
+        .with_exposed_port(ContainerPort::Tcp(80))
+        .with_wait_for(WaitFor::Http(Box::new(
+            HttpWaitStrategy::new("/")
+                .with_port(ContainerPort::Tcp(80))
+                .with_response_matcher(|_| true),
+        )))
+        .with_network("bridge")
+        .with_mount(Mount::bind_mount(
+            webroot_dir.to_string_lossy(),
+            "/var/www/ferron",
+        ))
+        .with_mount(Mount::bind_mount(
+            config_file.to_string_lossy(),
+            "/etc/ferron.conf",
+        ))
+        .start()
+        .await
+}
+
+#[tokio::test]
+async fn test_cache_hit() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache true
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+    let response = reqwest::get(format!(
+        "http://localhost:{}/test.txt",
+        container
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap()
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v2".as_bytes()).unwrap();
+    let response = reqwest::get(format!(
+        "http://localhost:{}/test.txt",
+        container
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap()
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_private_scope_requires_identity_not_ip() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "private, max-age=60"
+        cache true
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+    let base_url = format!(
+        "http://localhost:{}/",
+        container
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap()
+    );
+
+    // Two clients on the same public IP with no identifying cookie must not
+    // share private data: every request is served from origin, never cached.
+    self::common::write_file(webroot_dir.path().join("private.txt"), "one".as_bytes()).unwrap();
+    let first = reqwest::get(format!("{base_url}private.txt"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(first.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*first.bytes().await.unwrap(), b"one");
+
+    self::common::write_file(webroot_dir.path().join("private.txt"), "two".as_bytes()).unwrap();
+    let second = reqwest::get(format!("{base_url}private.txt"))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(second.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*second.bytes().await.unwrap(), b"two");
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_expiry() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=2"
+        cache true
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+    let response = reqwest::get(format!(
+        "http://localhost:{}/test.txt",
+        container
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap()
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v2".as_bytes()).unwrap();
+    let response = reqwest::get(format!(
+        "http://localhost:{}/test.txt",
+        container
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap()
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v2");
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_only_if_cached() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache true
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+    let client = reqwest::Client::new();
+    let url = format!(
+        "http://localhost:{}/test.txt",
+        container
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap()
+    );
+
+    // Nothing cached yet: only-if-cached must yield 504 without contacting the origin.
+    let response = client
+        .get(&url)
+        .header("Cache-Control", "only-if-cached")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("bypass")
+    );
+
+    // Cache the resource normally.
+    let response = client.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    // only-if-cached now hits the fresh stored entry.
+    let response = client
+        .get(&url)
+        .header("Cache-Control", "only-if-cached")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_request_max_age_revalidates() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache true
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+    let client = reqwest::Client::new();
+    let url = format!(
+        "http://localhost:{}/test.txt",
+        container
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap()
+    );
+
+    let response = client.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    // max-age=0 forces revalidation while the stored entry is still fresh.
+    // Sleep so the rewritten file gets a new Last-Modified timestamp.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v2".as_bytes()).unwrap();
+    let response = client
+        .get(&url)
+        .header("Cache-Control", "max-age=0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(&*response.bytes().await.unwrap(), b"v2");
+
+    // A plain request within the TTL now serves the refreshed entry from cache.
+    let response = client.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v2");
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_request_no_store() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache true
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("cached.txt"), "v1".as_bytes()).unwrap();
+    self::common::write_file(webroot_dir.path().join("fresh.txt"), "f1".as_bytes()).unwrap();
+    let client = reqwest::Client::new();
+    let port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(80))
+        .await
+        .unwrap();
+
+    // Prime the cache for cached.txt.
+    let response = client
+        .get(format!("http://localhost:{}/cached.txt", port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    // A no-store request still serves the fresh stored entry (RFC 9111 §5.2.1.5).
+    let response = client
+        .get(format!("http://localhost:{}/cached.txt", port))
+        .header("Cache-Control", "no-store")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    // A no-store request that misses is forwarded but its response is not stored.
+    let response = client
+        .get(format!("http://localhost:{}/fresh.txt", port))
+        .header("Cache-Control", "no-store")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let cache_status =
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .to_string();
+    assert!(cache_status.contains("fwd=miss"));
+    assert!(cache_status.contains("stored=false"));
+    assert_eq!(&*response.bytes().await.unwrap(), b"f1");
+
+    // The following request misses again: the no-store response left no entry.
+    let response = client
+        .get(format!("http://localhost:{}/fresh.txt", port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let cache_status =
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .to_string();
+    assert!(cache_status.contains("fwd=miss"));
+    assert!(cache_status.contains("stored=true"));
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_purge_authorization() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    // Host a requires basic auth (alice/secret123). Host b has no basic_auth
+    // and no allow list. Host c purges via an allow-listed IP.
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      a.example.com:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache {
+          purge_method
+        }
+        basic_auth {
+          users {
+            alice "$argon2id$v=19$m=19456,t=2,p=1$1XZH7AjwFRBV5f1z+BirSw$aHX2OgWWGHjtMy07YE+a6YOK0UQKS7GK5ZUMEcWGE74"
+          }
+        }
+      }
+
+      b.example.com:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache {
+          purge_method
+        }
+      }
+
+      c.example.com:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache {
+          purge_method
+          purge_allowed_ips "0.0.0.0/0"
+        }
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+    let client = reqwest::Client::new();
+    let port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(80))
+        .await
+        .unwrap();
+    let url = || format!("http://localhost:{}/test.txt", port);
+    let purge = |host: &str| {
+        client
+            .request(reqwest::Method::from_bytes(b"PURGE").unwrap(), url())
+            .header("Host", host)
+    };
+    let auth_get = |host: &str| {
+        client
+            .get(url())
+            .header("Host", host)
+            .basic_auth("alice", Some("secret123"))
+    };
+
+    // Prime host a's cache.
+    let response = auth_get("a.example.com").send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+
+    // PURGE with matching basic auth succeeds.
+    let response = purge("a.example.com")
+        .basic_auth("alice", Some("secret123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // The entry was removed: the next request misses again.
+    let response = auth_get("a.example.com").send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+
+    // PURGE without credentials on a protected host is rejected by basic_auth.
+    let response = purge("a.example.com").send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Foreign basic auth (valid on a.example.com) cannot purge host b, which
+    // has no basic_auth block in scope.
+    let response = purge("b.example.com")
+        .basic_auth("alice", Some("secret123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Unauthenticated PURGE on host b is also rejected.
+    let response = purge("b.example.com").send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // An allow-listed IP purges without credentials.
+    let response = purge("c.example.com").send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_purge_scoped_to_requesting_host() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    // Two hosts share one named cache zone. A PURGE from one host must not
+    // touch the other host's entries.
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      a.example.com:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache {
+          zone "shared"
+          purge_method
+          purge_allowed_ips "0.0.0.0/0"
+        }
+      }
+
+      b.example.com:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache {
+          zone "shared"
+          purge_method
+          purge_allowed_ips "0.0.0.0/0"
+        }
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+    let client = reqwest::Client::new();
+    let port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(80))
+        .await
+        .unwrap();
+    let url = format!("http://localhost:{}/test.txt", port);
+
+    let get = |host: &str| client.get(&url).header("Host", host).send();
+    let purge = |host: &str| {
+        client
+            .request(reqwest::Method::from_bytes(b"PURGE").unwrap(), &url)
+            .header("Host", host)
+            .send()
+    };
+
+    // Both hosts prime the shared zone.
+    let response = get("a.example.com").await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response = get("b.example.com").await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    drop(response);
+
+    // PURGE from host a removes only host a's entry.
+    let response = purge("a.example.com").await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    drop(response);
+
+    let response = get("a.example.com").await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    drop(response);
+
+    let response = get("b.example.com").await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    drop(response);
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_propagation_purge_requires_shared_secret() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      a.example.com:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache {
+          purge_method
+          purge_allowed_ips "0.0.0.0/0"
+          purge_propagation {
+            shared_secret "hunter2"
+          }
+        }
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+    let client = reqwest::Client::new();
+    let port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(80))
+        .await
+        .unwrap();
+    let url = format!("http://localhost:{}/test.txt", port);
+
+    let propagated_purge = |secret: Option<&str>| {
+        let mut request = client
+            .request(reqwest::Method::from_bytes(b"PURGE").unwrap(), &url)
+            .header("Host", "a.example.com")
+            .header("X-Purge-Source", "propagation");
+        if let Some(secret) = secret {
+            request = request.header("X-Purge-Secret", secret);
+        }
+        request.send()
+    };
+
+    // Prime the cache.
+    let response = client
+        .get(&url)
+        .header("Host", "a.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // A propagation claim without the secret is rejected.
+    let response = propagated_purge(None).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // So is a claim with the wrong secret.
+    let response = propagated_purge(Some("wrong")).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // The entry survives both rejections.
+    let response = client
+        .get(&url)
+        .header("Host", "a.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+
+    // A propagation claim with the matching secret purges.
+    let response = propagated_purge(Some("hunter2")).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let response = client
+        .get(&url)
+        .header("Host", "a.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_key_uses_resolved_vhost_case_insensitively() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      a.example.com:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache {
+          purge_method
+        }
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+    let client = reqwest::Client::new();
+    let port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(80))
+        .await
+        .unwrap();
+    let url = format!("http://localhost:{}/test.txt", port);
+
+    let get = |host: &str| client.get(&url).header("Host", host).send();
+
+    // Prime with a lowercase host, then request with mixed case. Both must
+    // resolve to the same vhost and produce the same cache key.
+    let response = get("a.example.com").await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+
+    let response = get("A.Example.COM").await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_vary() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=2"
+        cache {
+          vary "X-Test-Header"
+        }
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://localhost:{}/test.txt",
+            container
+                .get_host_port_ipv4(ContainerPort::Tcp(80))
+                .await
+                .unwrap()
+        ))
+        .header("X-Test-Header", "A")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v2".as_bytes()).unwrap();
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://localhost:{}/test.txt",
+            container
+                .get_host_port_ipv4(ContainerPort::Tcp(80))
+                .await
+                .unwrap()
+        ))
+        .header("X-Test-Header", "B")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v2");
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://localhost:{}/test.txt",
+            container
+                .get_host_port_ipv4(ContainerPort::Tcp(80))
+                .await
+                .unwrap()
+        ))
+        .header("X-Test-Header", "A")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_vary_cookies() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache {
+          vary_cookies "session_id"
+        }
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let base_url = format!(
+        "http://localhost:{}",
+        container
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap()
+    );
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+
+    // Request 1: cookie session_id=abc → miss
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .header("Cookie", "session_id=abc")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    // Request 2: same cookie session_id=abc → hit
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .header("Cookie", "session_id=abc")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    // Update the file to verify miss for different cookie
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v2".as_bytes()).unwrap();
+
+    // Request 3: different cookie session_id=xyz → miss
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .header("Cookie", "session_id=xyz")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v2");
+
+    // Request 4: no cookie → miss (different key from c:session_id=abc and c:session_id=xyz)
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v3".as_bytes()).unwrap();
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v3");
+
+    // Request 5: session_id=abc again → hit (still the original v1)
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .header("Cookie", "session_id=abc")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    container.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cache_vary_cookies_multiple() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Set umask to 000 to ensure that the webroot directory is accessible to the container.
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache {
+          vary_cookies "lang"
+          vary_cookies "theme"
+        }
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let base_url = format!(
+        "http://localhost:{}",
+        container
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap()
+    );
+
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v1".as_bytes()).unwrap();
+
+    // Request 1: cookie lang=en;theme=dark → miss
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .header("Cookie", "lang=en; theme=dark")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    // Request 2: same cookies → hit
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .header("Cookie", "lang=en; theme=dark")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    // Request 3: different theme cookie → miss
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v2".as_bytes()).unwrap();
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .header("Cookie", "lang=en; theme=light")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v2");
+
+    // Request 4: different lang cookie → miss
+    self::common::write_file(webroot_dir.path().join("test.txt"), "v3".as_bytes()).unwrap();
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .header("Cookie", "lang=fr; theme=dark")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("miss")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v3");
+
+    // Request 5: lang=en;theme=dark again → still hit with v1
+    let response = client
+        .get(format!("{}/test.txt", base_url))
+        .header("Cookie", "lang=en; theme=dark")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(response.headers().get("Cache-Status").unwrap().as_bytes())
+            .contains("hit")
+    );
+    assert_eq!(&*response.bytes().await.unwrap(), b"v1");
+
+    container.stop().await.unwrap();
+}
+
+// Helper to create a backend container for cache revalidation tests.
+async fn create_backend_container(
+    network: &str,
+) -> Result<ContainerAsync<GenericImage>, TestcontainersError> {
+    let backend_image = self::common::build_backend_image().await?;
+    backend_image
+        .with_exposed_port(ContainerPort::Tcp(3000))
+        .with_wait_for(WaitFor::Http(Box::new(
+            HttpWaitStrategy::new("/")
+                .with_port(ContainerPort::Tcp(3000))
+                .with_response_matcher(|_| true),
+        )))
+        .with_network(network)
+        .with_hostname("backend")
+        .start()
+        .await
+}
+
+/// Context for cache revalidation E2E tests using a reverse proxy + cache.
+struct CacheRevalidationTestContext {
+    _backend: ContainerAsync<GenericImage>,
+    _ferron: ContainerAsync<GenericImage>,
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl CacheRevalidationTestContext {
+    async fn new(test_name: &str) -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        #[cfg(unix)]
+        nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+        #[cfg(unix)]
+        let mut config_file = common::create_temp_file();
+        #[cfg(not(unix))]
+        let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+        let network = format!("e2e-test-cache-etag-{}", test_name);
+        let backend = create_backend_container(&network).await.unwrap();
+
+        config_file
+            .as_file_mut()
+            .write_all(
+                br#"
+      *:80 {
+        proxy "http://backend:3000"
+        cache {
+          emit_litespeed_headers true
+        }
+      }
+      "#,
+            )
+            .unwrap();
+
+        let ferron_image = self::common::build_ferron_image().await.unwrap();
+        let ferron = ferron_image
+            .with_exposed_port(ContainerPort::Tcp(80))
+            .with_wait_for(WaitFor::Http(Box::new(
+                HttpWaitStrategy::new("/")
+                    .with_port(ContainerPort::Tcp(80))
+                    .with_response_matcher(|_| true),
+            )))
+            .with_network(&network)
+            .with_hostname("ferron")
+            .with_mount(Mount::bind_mount(
+                config_file.path().to_string_lossy().to_string(),
+                "/etc/ferron.conf",
+            ))
+            .start()
+            .await
+            .unwrap();
+
+        let port = ferron
+            .get_host_port_ipv4(ContainerPort::Tcp(80))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        Self {
+            _backend: backend,
+            _ferron: ferron,
+            base_url: format!("http://localhost:{}", port),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn get(&self, path: &str) -> reqwest::Response {
+        self.client
+            .get(format!(
+                "{}/{}",
+                self.base_url,
+                path.trim_start_matches('/')
+            ))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn get_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> reqwest::Response {
+        let mut req = self.client.get(format!(
+            "{}/{}",
+            self.base_url,
+            path.trim_start_matches('/')
+        ));
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        req.send().await.unwrap()
+    }
+
+    async fn update_backend_version(&self, id: &str) {
+        // Access the backend container directly (not through Ferron) to update
+        // the stored version counter. Both containers are on the same network.
+        let backend_port = self
+            ._backend
+            .get_host_port_ipv4(ContainerPort::Tcp(3000))
+            .await
+            .unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://localhost:{}/cache-etag/update?id={}",
+                backend_port, id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+}
+
+#[tokio::test]
+async fn test_cache_etag_revalidation_304() {
+    let ctx = CacheRevalidationTestContext::new("revalidate-304").await;
+
+    // First request: cache miss, stores response with ETag W/"v1"
+    let resp = ctx.get("/cache-etag?id=reval-304").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cache_status = resp
+        .headers()
+        .get("X-LiteSpeed-Cache")
+        .expect("X-LiteSpeed-Cache header missing")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(cache_status, "miss");
+    assert_eq!(resp.text().await.unwrap(), "v1");
+
+    // Second request with max-age=0: triggers conditional revalidation.
+    // Backend receives If-None-Match: W/"v1" and returns 304.
+    // Ferron should reconstruct a 200 response with the cached body.
+    let resp = ctx
+        .get_with_headers(
+            "/cache-etag?id=reval-304",
+            &[("Cache-Control", "max-age=0")],
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cache_status = resp
+        .headers()
+        .get("X-LiteSpeed-Cache")
+        .expect("X-LiteSpeed-Cache header missing")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(cache_status, "hit");
+    // The Cache-Status header should indicate revalidation
+    let cache_status_header = resp
+        .headers()
+        .get("Cache-Status")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        cache_status_header.contains("revalidated"),
+        "Expected revalidated Cache-Status, got: {}",
+        cache_status_header
+    );
+    assert_eq!(resp.text().await.unwrap(), "v1");
+}
+
+#[tokio::test]
+async fn test_cache_etag_content_change() {
+    let ctx = CacheRevalidationTestContext::new("content-change").await;
+
+    // First request: cache miss
+    let resp = ctx.get("/cache-etag?id=content-change").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "v1");
+
+    // Trigger a content update on the backend
+    ctx.update_backend_version("content-change").await;
+
+    // Request with max-age=0: backend now returns v2 with new ETag
+    let resp = ctx
+        .get_with_headers(
+            "/cache-etag?id=content-change",
+            &[("Cache-Control", "max-age=0")],
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cache_status = resp
+        .headers()
+        .get("X-LiteSpeed-Cache")
+        .expect("X-LiteSpeed-Cache header missing")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(cache_status, "miss");
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "v2",
+        "Should return updated content"
+    );
+
+    // Next unconditional request should hit the cache with the new content
+    let resp = ctx.get("/cache-etag?id=content-change").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cache_status = resp
+        .headers()
+        .get("X-LiteSpeed-Cache")
+        .expect("X-LiteSpeed-Cache header missing")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(cache_status, "hit");
+    assert_eq!(resp.text().await.unwrap(), "v2");
+}
+
+#[tokio::test]
+async fn test_cache_no_cache_triggers_revalidation() {
+    let ctx = CacheRevalidationTestContext::new("no-cache-reval").await;
+
+    // First request: cache miss
+    let resp = ctx.get("/cache-etag?id=no-cache-reval").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "v1");
+
+    // Request with Cache-Control: no-cache triggers revalidation
+    let resp = ctx
+        .get_with_headers(
+            "/cache-etag?id=no-cache-reval",
+            &[("Cache-Control", "no-cache")],
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cache_status_old = resp
+        .headers()
+        .get("Cache-Status")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        cache_status_old.contains("revalidated"),
+        "Expected revalidated Cache-Status for no-cache, got: {}",
+        cache_status_old
+    );
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "v1",
+        "should return cached content after 304"
+    );
+}
+
+/// Test stale-while-revalidate behavior.
+///
+/// After the entry expires, a concurrent follower is served the stale body
+/// while the leader revalidates upstream and receives the fresh body.
+#[tokio::test]
+async fn test_cache_stale_while_revalidate() {
+    let ctx = CacheRevalidationTestContext::new("swr").await;
+    let backend_port = ctx
+        ._backend
+        .get_host_port_ipv4(ContainerPort::Tcp(3000))
+        .await
+        .unwrap();
+    let backend = reqwest::Client::new();
+
+    // First request: cache miss, stores response with max-age=1, stale-while-revalidate=60
+    let resp = ctx.get("/cache-swr?id=swr-test").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cache_status = resp
+        .headers()
+        .get("X-LiteSpeed-Cache")
+        .expect("X-LiteSpeed-Cache header missing")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(cache_status, "miss");
+    assert_eq!(resp.text().await.unwrap(), "swr-v1");
+
+    // Wait for the entry to expire (max-age=1s)
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Bump the version to v2 and make the next upstream fetch slow, so the
+    // leader stays in flight while a concurrent follower observes the stale
+    // entry.
+    backend
+        .post(format!(
+            "http://localhost:{}/cache-swr/update?id=swr-test",
+            backend_port
+        ))
+        .send()
+        .await
+        .unwrap();
+    backend
+        .post(format!(
+            "http://localhost:{}/cache-swr/slow?id=swr-test",
+            backend_port
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    // Fire two concurrent requests. One becomes the leader and revalidates
+    // with the backend (v2), the other becomes a follower and is served the
+    // stale entry (v1) while the leader is in flight.
+    let (leader, follower) = tokio::join!(
+        biased;
+
+        ctx.get("/cache-swr?id=swr-test"),
+        ctx.get("/cache-swr?id=swr-test")
+    );
+    assert_eq!(leader.status(), reqwest::StatusCode::OK);
+    assert_eq!(follower.status(), reqwest::StatusCode::OK);
+
+    let leader_version = leader
+        .headers()
+        .get("X-Backend-Version")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let follower_version = follower
+        .headers()
+        .get("X-Backend-Version")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let mut versions = vec![leader_version, follower_version];
+    versions.sort();
+    assert_eq!(
+        versions,
+        vec!["1".to_string(), "2".to_string()],
+        "leader must receive the fresh response and the follower the stale one"
+    );
+
+    let leader_status = leader
+        .headers()
+        .get("Cache-Status")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let follower_status = follower
+        .headers()
+        .get("Cache-Status")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    assert!(
+        leader_status.contains("revalidated"),
+        "leader Cache-Status should be revalidated, got: {}",
+        leader_status
+    );
+    assert!(
+        follower_status.contains("stale-while-revalidate"),
+        "follower Cache-Status should be stale-while-revalidate, got: {}",
+        follower_status
+    );
+}
+
+/// Test stale-if-error behavior
+#[tokio::test]
+async fn test_cache_stale_if_error() {
+    let ctx = CacheRevalidationTestContext::new("sie").await;
+
+    // First request: cache miss, stores response with max-age=300, stale-if-error=60
+    let resp = ctx.get("/cache-sie?id=sie-test").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cache_status = resp
+        .headers()
+        .get("X-LiteSpeed-Cache")
+        .expect("X-LiteSpeed-Cache header missing")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(cache_status, "miss");
+    assert_eq!(resp.text().await.unwrap(), "sie-v1");
+
+    // Enable error mode on the backend
+    let backend_port = ctx
+        ._backend
+        .get_host_port_ipv4(ContainerPort::Tcp(3000))
+        .await
+        .unwrap();
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://localhost:{}/cache-sie/error?id=sie-test",
+            backend_port
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // Request with max-age=0 to trigger revalidation with the backend
+    // Backend returns 503, Ferron should serve stale content (SIE)
+    let resp = ctx
+        .get_with_headers("/cache-sie?id=sie-test", &[("Cache-Control", "max-age=0")])
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cache_status = resp
+        .headers()
+        .get("X-LiteSpeed-Cache")
+        .expect("X-LiteSpeed-Cache header missing")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(cache_status, "hit", "SIE should serve stale as hit");
+
+    // Verify Cache-Status header labels stale-if-error correctly
+    let cache_status_header = resp
+        .headers()
+        .get("Cache-Status")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        cache_status_header.contains("stale-if-error"),
+        "Cache-Status should label stale-if-error, got: {}",
+        cache_status_header
+    );
+    assert!(
+        !cache_status_header.contains("stale-while-revalidate"),
+        "Cache-Status must not mislabel SIE as stale-while-revalidate, got: {}",
+        cache_status_header
+    );
+
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "sie-v1",
+        "SIE should return stale content"
+    );
+}
+
+/// Regression test: cache revalidation with If-None-Match on static files.
+///
+/// Verifies that when a client revalidates a cached static file with
+/// `Cache-Control: max-age=0` and an `If-None-Match` ETag, the server
+/// correctly handles the conditional response (304 or 200).
+#[tokio::test]
+async fn test_cache_static_etag_revalidation() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    #[cfg(unix)]
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits(0o000).unwrap());
+
+    #[cfg(unix)]
+    let webroot_dir = common::create_temp_dir();
+    #[cfg(unix)]
+    let mut config_file = common::create_temp_file();
+    #[cfg(not(unix))]
+    let webroot_dir = tempfile::tempdir().unwrap();
+    #[cfg(not(unix))]
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+
+    config_file
+        .as_file_mut()
+        .write_all(
+            r#"
+      *:80 {
+        root "/var/www/ferron"
+        file_cache_control "public, max-age=60"
+        cache true
+      }
+  "#
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let container = common::create_ferron_container(webroot_dir.path(), config_file.path())
+        .await
+        .unwrap();
+
+    let port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(80))
+        .await
+        .unwrap();
+    let base_url = format!("http://localhost:{}", port);
+
+    // Write a static file and cache it
+    common::write_file(webroot_dir.path().join("etag-test.txt"), b"content").unwrap();
+
+    // Request 1: cache miss, response includes ETag header
+    let client = reqwest::Client::new();
+    let resp1 = client
+        .get(format!("{}/etag-test.txt", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), reqwest::StatusCode::OK);
+    let etag = resp1
+        .headers()
+        .get("ETag")
+        .expect("response should include ETag header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(resp1.text().await.unwrap(), "content");
+
+    // Request 2: conditional revalidation with max-age=0 and If-None-Match
+    let resp2 = client
+        .get(format!("{}/etag-test.txt", base_url))
+        .header("Cache-Control", "max-age=0")
+        .header("If-None-Match", &etag)
+        .send()
+        .await
+        .unwrap();
+
+    // The response should be either 304 (not modified) or 200 (content changed).
+    // Before the fix, the server would always return 200 even when the backend
+    // responded with 304.
+    match resp2.status() {
+        s if s == reqwest::StatusCode::NOT_MODIFIED => {
+            // 304 must not include a body
+            assert!(
+                resp2.text().await.unwrap().is_empty(),
+                "304 response should have empty body"
+            );
+        }
+        s if s == reqwest::StatusCode::OK => {
+            // 200 must include the body
+            assert_eq!(resp2.text().await.unwrap(), "content");
+        }
+        other => panic!("expected 304 or 200, got {}", other),
+    }
+
+    // Request 3: repeat the same conditional request, same expectation
+    let resp3 = client
+        .get(format!("{}/etag-test.txt", base_url))
+        .header("Cache-Control", "max-age=0")
+        .header("If-None-Match", &etag)
+        .send()
+        .await
+        .unwrap();
+
+    match resp3.status() {
+        s if s == reqwest::StatusCode::NOT_MODIFIED => {
+            assert!(
+                resp3.text().await.unwrap().is_empty(),
+                "304 response should have empty body"
+            );
+        }
+        s if s == reqwest::StatusCode::OK => {
+            assert_eq!(resp3.text().await.unwrap(), "content");
+        }
+        other => panic!("expected 304 or 200, got {}", other),
+    }
+
+    container.stop().await.unwrap();
+}

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "bin",
+    "core",
+    "entrypoint",
+    "modules/*",
+    "types/*",
+    "utils/*"
+]
+exclude = [
+    "doctest",
+    "e2e",
+    "fuzz",
+]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[workspace.lints.clippy]
+unwrap_used = { level = "warn" }
+redundant_clone = { level = "warn" }

@@ -1,0 +1,122 @@
+.body-main {
+    max-width: 64em;
+}
+
+.directory-header {
+    text-align: left;
+    margin-top: 1em;
+    margin-bottom: 1.5em;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+
+.directory-header h1 {
+    font-size: 2em;
+    margin: 0;
+}
+
+.directory-path {
+    color: var(--muted);
+}
+
+.directory-listing {
+    border-spacing: 0;
+    width: 100%;
+    overflow-wrap: break-word;
+    word-break: break-word;
+    border: 1px solid var(--border);
+    overflow: hidden;
+}
+
+.directory-listing thead th {
+    background-color: var(--surface);
+    font-weight: 600;
+    font-size: 1em;
+    color: var(--muted);
+}
+
+.directory-listing th,
+.directory-listing td {
+    padding: 0.5em 1em;
+    border-bottom: 1px solid var(--border);
+}
+
+.directory-listing tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.directory-listing tbody tr td {
+    transition: background-color 0.25s ease-in-out;
+}
+
+.directory-listing tbody tr:hover td {
+    background-color: color-mix(in srgb, var(--surface) 50%, transparent);
+}
+
+.directory-icon {
+    margin-right: 0.5em;
+}
+
+.directory-filename {
+    text-align: left;
+}
+
+.directory-size {
+    text-align: right;
+    white-space: nowrap;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.directory-date {
+    text-align: right;
+    white-space: nowrap;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.directory-description {
+    margin-top: 1.5em;
+    padding: 1em 1.25em;
+    border: 1px solid var(--border);
+    background-color: var(--surface);
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 1em;
+}
+
+.directory-listing a {
+    color: var(--foreground);
+    font-weight: 600;
+    transition: color 0.1s ease-in-out;
+}
+
+.directory-listing a.directory-parent {
+    color: var(--muted);
+    font-weight: 400;
+}
+
+.directory-listing a:hover,
+.directory-listing a:focus,
+.directory-listing a.directory-parent:hover,
+.directory-listing a.directory-parent:focus {
+    color: var(--accent);
+}
+
+@media screen and (max-width: 768px) {
+    .directory-header {
+        margin-top: 0;
+    }
+}
+
+@media screen and (max-width: 512px) {
+    .directory-listing th,
+    .directory-listing td {
+        padding: 0.5em 0.65em;
+    }
+
+    .directory-date {
+        display: none;
+    }
+}

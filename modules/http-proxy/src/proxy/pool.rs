@@ -1,0 +1,809 @@
+//! Connection pool management logic.
+
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ferron_http::trace_context::current_event_trace_context;
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio_rustls::TlsConnector;
+use zincio_hyper::ZincioIo;
+
+use crate::config::ProxyConfig;
+use crate::connections::{ConnectionManager, PooledConnection};
+use crate::proxy::cached_tls_config;
+use crate::proxy::connect::build_proxy_protocol_header;
+use crate::send_net_io::SendTcpStreamPoll;
+#[cfg(unix)]
+use crate::send_net_io::SendUnixStreamPoll;
+use crate::send_request::{
+    http1_handshake, http2_handshake, BodyTrackingState, ContentLengthTrackingBody,
+    SendRequestWrapper, TrackedBody, TruncatedTracker,
+};
+use crate::types::error::ProxyError;
+use crate::types::upstream::ResolvedUpstream;
+use crate::types::ConnectionsTrackState;
+use crate::ProxyMetrics;
+use ferron_http::HttpContext;
+
+/// Try to send a request using the connection pool.
+///
+/// Steps:
+/// 1. Obtains an item from the connection pool.
+/// 2. Waits either for the connection from the item to be ready,
+///    or for a new connection to be established (raced).
+///    If the item doesn't contain a connection, step 2 also involves
+///    waiting until an item with an existing connection is returned.
+/// 3. Uses that connection to send the request.
+#[allow(clippy::too_many_arguments, clippy::needless_return)]
+#[inline]
+pub async fn try_send_with_pool(
+    ctx: &mut HttpContext,
+    config: &ProxyConfig,
+    cm: &ConnectionManager,
+    upstream: Arc<ResolvedUpstream>,
+    proxy_url: &http::Uri,
+    client_ip: Option<IpAddr>,
+    local_limit: Option<usize>,
+    idle_timeout: Duration,
+    is_https: bool,
+    _conn_state: Option<&ConnectionsTrackState>,
+    tracked_connection: Option<Arc<()>>,
+    metrics: &mut ProxyMetrics,
+) -> Result<ferron_http::HttpResponse, ProxyError> {
+    let mut pull_start = None;
+    let item_fut = async {
+        if let Some(limit) = local_limit {
+            cm.pull_with_local_limit(upstream.clone(), client_ip, Some(limit), idle_timeout)
+                .await
+        } else {
+            cm.pull(upstream.clone(), client_ip, idle_timeout).await
+        }
+    };
+    let pull_start_set_fut = async {
+        if pull_start.is_none() {
+            pull_start = Some(std::time::Instant::now());
+        }
+        std::future::pending().await
+    };
+    let mut item = tokio::select! {
+        biased;
+        item = item_fut => item,
+        item_mock = pull_start_set_fut => item_mock,
+    };
+
+    // Track pool wait metrics
+    if let Some(pull_duration) = pull_start.map(|d| d.elapsed().as_secs_f64()) {
+        metrics.pool_waits += 1;
+        metrics.pool_wait_time_secs += pull_duration;
+    }
+
+    let (is_ready, should_keep) = if let Some(wrapper) = item.inner_mut() {
+        wrapper.check_ready(Some(idle_timeout))
+    } else {
+        (false, false)
+    };
+
+    if is_ready {
+        metrics.connection_reused = true;
+        metrics.pool_hit = true;
+        let wrapper = item
+            .inner_mut()
+            .take()
+            .expect("invalid reverse proxy conn pool item state");
+        return send_via_wrapper(
+            ctx,
+            config,
+            wrapper,
+            item,
+            proxy_url,
+            tracked_connection,
+            true,
+            upstream.proxy_unix.is_some(),
+            local_limit,
+            metrics,
+        )
+        .await;
+    }
+
+    let is_unix = upstream.proxy_unix.is_some();
+
+    if item.inner().is_some() && should_keep {
+        // Item contains a pending (alive but not ready) connection.
+        // Don't establish a new connection in the meantime, to prevent handle exhaustion.
+        if wait_for_ready(&mut item, idle_timeout).await {
+            metrics.connection_reused = true;
+            metrics.pool_hit = true;
+            let wrapper = item
+                .inner_mut()
+                .take()
+                .expect("pending item should have inner value");
+            return send_via_wrapper(
+                ctx,
+                config,
+                wrapper,
+                item,
+                proxy_url,
+                tracked_connection,
+                true,
+                is_unix,
+                local_limit,
+                metrics,
+            )
+            .await;
+        } else {
+            // Pooled connection became dead / idle-expired, fall back to new connection
+            // New connection logic is below
+        }
+    }
+
+    // Item has no connection (empty slot) or dead connection.
+    // Clear dead wrapper if any and race waiting for a returned pooled connection
+    // against establishing a new connection.
+    if item.inner().is_some() {
+        *item.inner_mut() = None;
+    }
+    let mut original_item = Some(item);
+
+    tokio::select! {
+        biased;
+
+        pooled = wait_for_returned(cm, upstream.clone(), client_ip, local_limit, idle_timeout) => {
+            if let Some((pooled_item, wrapper)) = pooled {
+                // Use the returned pooled connection
+                drop(original_item.take());
+                metrics.connection_reused = true;
+                metrics.pool_hit = true;
+                return send_via_wrapper(
+                    ctx,
+                    config,
+                    wrapper,
+                    pooled_item,
+                    proxy_url,
+                    tracked_connection,
+                    true,
+                    is_unix,
+                    local_limit,
+                    metrics,
+                )
+                .await;
+            } else {
+                // Should not happen (loops forever), fall back to new
+                let wrapper = establish_wrapper(ctx, config, upstream.clone(), proxy_url, client_ip, is_https, metrics).await?;
+                metrics.pool_miss = true;
+                let item = original_item.take().expect("original item missing");
+                return send_via_wrapper(
+                    ctx,
+                    config,
+                    wrapper,
+                    item,
+                    proxy_url,
+                    tracked_connection,
+                    config.keepalive,
+                    is_unix,
+                    local_limit,
+                    metrics,
+                )
+                .await;
+            }
+        },
+        res = establish_wrapper(ctx, config, upstream.clone(), proxy_url, client_ip, is_https, metrics) => {
+            match res {
+                Ok(wrapper) => {
+                    metrics.pool_miss = true;
+                    let item = original_item.take().expect("original item missing");
+                    return send_via_wrapper(
+                        ctx,
+                        config,
+                        wrapper,
+                        item,
+                        proxy_url,
+                        tracked_connection,
+                        config.keepalive,
+                        is_unix,
+                        local_limit,
+                        metrics,
+                    )
+                    .await;
+                },
+                Err(e) => {
+                    // New connection failed; don't wait for a returned pooled connection
+                    // so to not time out
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Wait for the pending connection to become ready.
+///
+/// Bounded by `idle_timeout`: a connection whose previous body never drains
+/// must not hold its pool slot (and the downstream active-request slot)
+/// until pipeline timeout. On timeout the caller falls back to establishing
+/// a fresh connection. Dropping the surrounding stage future (pipeline
+/// timeout) drops the owned `PooledConnection`, releasing the slot via its
+/// `Drop` impl, so no slot leaks on cancellation either.
+#[inline]
+async fn wait_for_ready(pending_item: &mut PooledConnection, idle_timeout: Duration) -> bool {
+    if let Some(wrapper) = pending_item.inner_mut() {
+        // `wait_ready` only enforces idle expiry after readiness, so bound
+        // the pend itself.
+        return zincio::time::timeout(idle_timeout, wrapper.wait_ready(Some(idle_timeout)))
+            .await
+            .unwrap_or_default();
+    }
+
+    false
+}
+
+/// Wait until a pooled item with an existing connection is returned.
+///
+/// This is used when the initially pulled item contained no connection.
+/// The function loops, pulling from the pool and waiting for a returned
+/// connection to appear. It is raced against establishing a new connection,
+/// so it is cancelled as soon as the new connection wins.
+#[inline]
+async fn wait_for_returned(
+    cm: &ConnectionManager,
+    upstream: Arc<ResolvedUpstream>,
+    client_ip: Option<IpAddr>,
+    local_limit: Option<usize>,
+    idle_timeout: Duration,
+) -> Option<(PooledConnection, SendRequestWrapper)> {
+    loop {
+        // Pull from the pool (waits if at capacity, otherwise returns immediately)
+        let mut next_item = if let Some(limit) = local_limit {
+            cm.pull_existing_with_local_limit(
+                upstream.clone(),
+                client_ip,
+                Some(limit),
+                idle_timeout,
+            )
+            .await
+        } else {
+            cm.pull_existing(upstream.clone(), client_ip, idle_timeout)
+                .await
+        };
+
+        if let Some(wrapper) = next_item.inner_mut() {
+            let (is_ready, should_keep) = wrapper.check_ready(Some(idle_timeout));
+            if is_ready {
+                let w = next_item
+                    .inner_mut()
+                    .take()
+                    .expect("pool item state is invalid at this point");
+                return Some((next_item, w));
+            }
+            if should_keep {
+                // Bound like `wait_for_ready`: never hold the pull loop
+                // past `idle_timeout` for one busy connection. This loop is
+                // additionally raced against establishing a new connection
+                // by the caller, so a timeout here just moves to the next
+                // candidate instead of stalling the request.
+                let ready =
+                    zincio::time::timeout(idle_timeout, wrapper.wait_ready(Some(idle_timeout)))
+                        .await
+                        .unwrap_or_default();
+                if ready {
+                    let w = next_item
+                        .inner_mut()
+                        .take()
+                        .expect("pool item state is invalid at this point");
+                    return Some((next_item, w));
+                }
+            }
+            // Dead or not ready after wait, discard and continue
+            let _ = next_item.take();
+            continue;
+        } else {
+            // No idle connection available; drop the empty slot
+            // The wait happens in .pull_existing*()
+            drop(next_item);
+            continue;
+        }
+    }
+}
+
+/// Classify a connect failure into a proxy error. `scheme` is used only in
+/// the error message prefix.
+#[inline]
+fn classify_connect_error(kind: std::io::ErrorKind, scheme: &str, error: &str) -> ProxyError {
+    match kind {
+        std::io::ErrorKind::TimedOut => {
+            ProxyError::Timeout(format!("{scheme} connect failed: {error}"))
+        }
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::HostUnreachable => {
+            ProxyError::ConnectFailedUnavailable(format!("{scheme} connect failed: {error}"))
+        }
+        _ => ProxyError::ConnectFailed(format!("{scheme} connect failed: {error}")),
+    }
+}
+
+/// TCP connect adapter: establish a TCP stream to the upstream address and
+/// classify the failure.
+#[inline]
+async fn connect_tcp(
+    addr: &str,
+    ctx: &mut HttpContext,
+) -> Result<zincio::net::PollTcpStream, ProxyError> {
+    let tcp = match zincio::net::PollTcpStream::connect(addr)
+        .await
+        .map_err(|e| {
+            ctx.events.emit(ferron_observability::Event::Log(
+                ferron_observability::LogEvent {
+                    level: ferron_observability::LogLevel::Warn,
+                    message: format!("Reverse proxy: TCP connect to {addr} failed: {e}"),
+                    summary: "Reverse proxy: TCP connect to backend failed".into(),
+                    target: "ferron-http-proxy",
+                    attributes: vec![(
+                        "upstream.address",
+                        ferron_observability::LogAttributeValue::String(addr.to_string()),
+                    )],
+                    trace_context: current_event_trace_context(ctx),
+                },
+            ));
+            e
+        }) {
+        Ok(s) => s,
+        Err(e) => return Err(classify_connect_error(e.kind(), "TCP", &e.to_string())),
+    };
+    Ok(tcp)
+}
+
+/// Unix connect adapter: establish a Unix stream and classify the failure.
+#[cfg(unix)]
+#[inline]
+async fn connect_unix(path: &str) -> Result<zincio::net::PollUnixStream, ProxyError> {
+    zincio::net::PollUnixStream::connect(path)
+        .await
+        .map_err(|e| classify_connect_error(e.kind(), "Unix", &e.to_string()))
+}
+
+/// Shared PROXY-header / TLS / HTTP dispatch sequence for both TCP and Unix
+/// upstream connections. The stream and drop-guard types are erased into the
+/// generic parameters `S` and `G`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+async fn dispatch_handshake<S, G>(
+    ctx: &mut HttpContext,
+    config: &ProxyConfig,
+    upstream: &Arc<ResolvedUpstream>,
+    proxy_url: &http::Uri,
+    is_https: bool,
+    client_ip: Option<IpAddr>,
+    label: &str,
+    metrics: &mut ProxyMetrics,
+    mut stream: S,
+    drop_guard: G,
+) -> Result<SendRequestWrapper, ProxyError>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    G: 'static,
+{
+    if let Some(proxy_header_version) = config.proxy_header {
+        // The PROXY protocol header requires both local and remote
+        // addresses; skip it when either is unknown (Unix socket listeners).
+        if let (Some(cip), Some(local_addr), Some(remote_addr)) =
+            (client_ip, ctx.local_address, ctx.remote_address)
+        {
+            let header_bytes = build_proxy_protocol_header(
+                proxy_header_version,
+                cip,
+                local_addr.ip(),
+                remote_addr.port(),
+                local_addr.port(),
+            )?;
+            stream.write_all(&header_bytes).await.map_err(|e| {
+                ProxyError::ProxyProtocolWriteFailed(format!("PROXY header write failed: {e}"))
+            })?;
+        }
+    }
+
+    if is_https {
+        let connector = TlsConnector::from(cached_tls_config(
+            config.http2,
+            config.http2_only,
+            config.no_verification,
+            upstream.mtls.clone(),
+        ));
+        // Always use the original hostname for TLS SNI, not a pre-resolved IP.
+        let host = proxy_url.host().ok_or("upstream URL has no host")?;
+        let domain = ServerName::try_from(host.to_string())
+            .map_err(|e| format!("Invalid server name: {e}"))?;
+        let tls_start = std::time::Instant::now();
+        let tls_stream = match connector.connect(domain, stream).await {
+            Ok(s) => {
+                metrics.tls_handshake_time_secs += tls_start.elapsed().as_secs_f64();
+                s
+            }
+            Err(e) => {
+                metrics.tls_handshake_failures += 1;
+                ctx.events.emit(ferron_observability::Event::Log(
+                    ferron_observability::LogEvent {
+                        level: ferron_observability::LogLevel::Warn,
+                        message: format!("Reverse proxy: TLS handshake with {label} failed: {e}"),
+                        summary: "Reverse proxy: TLS handshake with backend failed".into(),
+                        target: "ferron-http-proxy",
+                        attributes: vec![
+                            (
+                                "upstream.address",
+                                ferron_observability::LogAttributeValue::String(label.to_string()),
+                            ),
+                            (
+                                "error.message",
+                                ferron_observability::LogAttributeValue::String(e.to_string()),
+                            ),
+                        ],
+                        trace_context: current_event_trace_context(ctx),
+                    },
+                ));
+                return Err(ProxyError::TlsHandshakeFailed(format!(
+                    "TLS handshake failed: {e}"
+                )));
+            }
+        };
+
+        let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
+        let use_http2 = (config.http2 && negotiated_h2) || config.http2_only;
+
+        if use_http2 {
+            http2_handshake(tls_stream, drop_guard).await
+        } else {
+            http1_handshake(tls_stream, drop_guard).await
+        }
+    } else if config.http2_only || config.http2 {
+        http2_handshake(stream, drop_guard).await
+    } else {
+        http1_handshake(stream, drop_guard).await
+    }
+}
+
+/// Establish a new upstream connection (TCP or Unix) and perform TLS/HTTP handshakes.
+///
+/// This helper contains the connection establishment part of the former
+/// without the final `send_via_wrapper` call so that the caller can race it
+/// against waiting for a pooled connection.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+async fn establish_wrapper(
+    ctx: &mut HttpContext,
+    config: &ProxyConfig,
+    upstream: Arc<ResolvedUpstream>,
+    proxy_url: &http::Uri,
+    client_ip: Option<IpAddr>,
+    is_https: bool,
+    metrics: &mut ProxyMetrics,
+) -> Result<SendRequestWrapper, ProxyError> {
+    let connect_start = std::time::Instant::now();
+
+    #[cfg(unix)]
+    let is_unix = upstream.proxy_unix.is_some();
+    #[cfg(not(unix))]
+    let is_unix = false;
+
+    let wrapper_fut = async {
+        if is_unix {
+            #[cfg(unix)]
+            {
+                let unix_path = upstream
+                    .proxy_unix
+                    .as_ref()
+                    .ok_or("Unix socket path not set")?;
+                let unix = connect_unix(unix_path).await?;
+                let mut stream = SendUnixStreamPoll::new(unix);
+                let drop_guard = unsafe { stream.get_drop_guard() };
+                dispatch_handshake(
+                    ctx, config, &upstream, proxy_url, is_https, client_ip, unix_path, metrics,
+                    stream, drop_guard,
+                )
+                .await
+            }
+            #[cfg(not(unix))]
+            {
+                unreachable!()
+            }
+        } else {
+            let addr = if let Some(ct) = &upstream.connect_to {
+                ct.to_string()
+            } else {
+                let host = proxy_url.host().ok_or("upstream URL has no host")?;
+                let port = proxy_url
+                    .port_u16()
+                    .unwrap_or(if is_https { 443 } else { 80 });
+                format!("{host}:{port}")
+            };
+
+            let tcp = connect_tcp(&addr, ctx).await?;
+            let mut stream = SendTcpStreamPoll::new(tcp);
+            let drop_guard = unsafe { stream.get_drop_guard() };
+            dispatch_handshake(
+                ctx, config, &upstream, proxy_url, is_https, client_ip, &addr, metrics, stream,
+                drop_guard,
+            )
+            .await
+        }
+    };
+    let wrapper_result = if let Some(t) = upstream.connection_timeout {
+        zincio::time::timeout(t, wrapper_fut).await
+    } else {
+        Ok(wrapper_fut.await)
+    };
+
+    metrics.connect_time_secs += connect_start.elapsed().as_secs_f64();
+
+    match wrapper_result {
+        Ok(Ok(w)) => Ok(w),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(ProxyError::Timeout(
+            "configured connection timeout elapsed".into(),
+        )),
+    }
+}
+
+/// Send request via a SendRequestWrapper and handle the response.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub async fn send_via_wrapper(
+    ctx: &mut HttpContext,
+    config: &ProxyConfig,
+    mut wrapper: SendRequestWrapper,
+    item: PooledConnection,
+    proxy_url: &http::Uri,
+    tracked_connection: Option<Arc<()>>,
+    enable_keepalive: bool,
+    is_unix: bool,
+    _local_limit: Option<usize>,
+    metrics: &mut ProxyMetrics,
+) -> Result<ferron_http::HttpResponse, ProxyError> {
+    let parts_cloned = {
+        let req = ctx.req.take();
+        if let Some(req) = req {
+            if req.method().is_idempotent() {
+                let (oparts, body) = req.into_parts();
+                let parts = oparts.clone();
+                ctx.req.replace(http::Request::from_parts(oparts, body));
+                Some(parts)
+            } else {
+                ctx.req.replace(req);
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let request = crate::proxy::request::construct_proxy_request(ctx, config, proxy_url)?;
+    let body_cloned = request.body().clone();
+    let extensions = request.extensions().clone();
+
+    let start = std::time::Instant::now();
+    let response = match wrapper.send_request(request).await {
+        Ok(resp) => {
+            let elapsed = start.elapsed().as_secs_f64();
+            metrics.upstream_time_secs = elapsed;
+            metrics.ttfb_secs = elapsed;
+            resp
+        }
+        Err(e) => {
+            if let Some(parts) = parts_cloned {
+                // parts_cloned = None if request method is not idempotent
+                // (meaning there could be different effects for same request)
+                if let Some(inner_body) = body_cloned.recycle() {
+                    // Recycle request body so to allow retries later on
+                    ctx.req
+                        .replace(http::Request::from_parts(parts, inner_body));
+                }
+            }
+            return Err(ProxyError::SendRequestError(format!("Bad gateway: {e}")));
+        }
+    };
+
+    let status = response.status();
+    metrics.status_code = Some(status.as_u16());
+
+    let (mut parts, body) = response.into_parts();
+
+    if status == http::StatusCode::SWITCHING_PROTOCOLS {
+        let response_upgrade = http::Response::from_parts(parts.clone(), ());
+        handle_upgrade(response_upgrade, extensions, ctx, item).await?;
+
+        crate::proxy::response::remove_headers_rfc7230(&mut parts);
+
+        Ok(ferron_http::HttpResponse::Custom(
+            http::Response::from_parts(parts, body.map_err(std::io::Error::other).boxed_unsync()),
+        ))
+    } else {
+        // For keepalive, we extract the wrapper and create a PoolReturnInfo.
+        // This prevents the PoolItem's Drop from running, and instead we manually
+        // return the connection via PoolReturnInfo when TrackedBody is dropped.
+
+        let backend_url = item.key().map(|k| k.0.proxy_to.clone()).unwrap_or_default();
+
+        let (pool_return_info, return_later) = if enable_keepalive && !wrapper.is_closed() {
+            // If HTTP/1.x is returned early, this might cause stall in the connection pool...
+            let return_later = !wrapper.multiplexable();
+            (
+                Some(crate::send_request::PoolReturnInfo::from_item(
+                    item, wrapper, is_unix,
+                )),
+                return_later,
+            )
+        } else {
+            // Item will be dropped here, returning connection to pool via its Drop impl
+            // (wrapper is consumed by the response and not returned to pool)
+            drop(item);
+            (None, false)
+        };
+
+        if config.intercept_errors && status.as_u16() >= 400 {
+            if return_later && pool_return_info.is_some() && !body.is_end_stream() {
+                // If there's a body and an HTTP/1.x connection would be returned,
+                // drain the response body.
+                //
+                // This is needed because HTTP/1.x does not support multiplexing.
+                zincio::spawn(async move {
+                    let _pool_return_info = pool_return_info;
+                    let mut body = body;
+                    while body.frame().await.is_some_and(|f| f.is_ok()) {
+                        // Just discard the body...
+                    }
+                });
+            }
+            return Ok(ferron_http::HttpResponse::BuiltinError(
+                status.as_u16(),
+                None,
+            ));
+        }
+
+        let expected_length = parts
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let tracking_state = BodyTrackingState::new(expected_length);
+
+        // Wrap body in ContentLengthTrackingBody for byte-level tracking
+        let tracking_body = ContentLengthTrackingBody::new(body, tracking_state.clone());
+
+        let truncated_tracker = TruncatedTracker::new(
+            tracking_state,
+            backend_url,
+            ctx.events.clone(),
+            ferron_http::trace_context::current_event_trace_context(ctx),
+        );
+
+        let tracked_body = TrackedBody::new(
+            tracking_body.map_err(std::io::Error::other),
+            tracked_connection,
+            Some(truncated_tracker),
+            if return_later {
+                pool_return_info
+            } else {
+                drop(pool_return_info);
+                None
+            },
+        );
+
+        crate::proxy::response::remove_headers_rfc7230(&mut parts);
+
+        let mut response = http::Response::from_parts(parts, tracked_body.boxed_unsync());
+        *response.version_mut() = http::Version::default();
+
+        Ok(ferron_http::HttpResponse::Custom(response))
+    }
+}
+
+/// Handle HTTP 101 Switching Protocols (WebSocket upgrades).
+#[inline]
+pub async fn handle_upgrade(
+    resp_for_upgrade: http::Response<()>,
+    req_extensions: http::Extensions,
+    ctx: &mut HttpContext,
+    mut item: PooledConnection,
+) -> Result<(), ProxyError> {
+    let mut upgrade_request = http::Request::new(http_body_util::Empty::<bytes::Bytes>::new());
+    *upgrade_request.extensions_mut() = req_extensions;
+
+    let events = ctx.events.clone();
+    let upstream = item.key().map(|k| &*k.0);
+    let trace_context = current_event_trace_context(ctx);
+    let mut upstream_attrs = Vec::with_capacity(2);
+    if let Some(backend) = upstream {
+        upstream_attrs.push((
+            "ferron.proxy.backend_url",
+            ferron_observability::LogAttributeValue::String(backend.proxy_to.clone()),
+        ));
+        if let Some(ref unix_path) = backend.proxy_unix {
+            upstream_attrs.push((
+                "ferron.proxy.backend_unix_path",
+                ferron_observability::LogAttributeValue::String(unix_path.clone()),
+            ));
+        }
+    }
+
+    // Take the inner value to prevent Drop from returning the connection to pool.
+    // For upgrade connections, we don't return them to the pool
+    // (upgrade connections are long-lived, not pooled).
+    // Letting item drop naturally decrements the outstanding counter.
+    let _wrapper = item.inner_mut().take();
+
+    let upgrade_future = zincio_http::prepare_upgrade(&mut upgrade_request);
+    zincio::spawn_detached(async move {
+        match hyper::upgrade::on(resp_for_upgrade).await {
+            Ok(upgraded_backend) => {
+                if let Some(upgraded_future) = upgrade_future {
+                    match upgraded_future.await {
+                        Some(upgraded_client) => {
+                            let mut backend = ZincioIo::new(upgraded_backend);
+                            let mut client = upgraded_client;
+
+                            if let Err(e) =
+                                tokio::io::copy_bidirectional(&mut backend, &mut client).await
+                            {
+                                let mut upstream_attrs = upstream_attrs;
+                                upstream_attrs.push((
+                                    "error.message",
+                                    ferron_observability::LogAttributeValue::String(e.to_string()),
+                                ));
+                                events.emit(ferron_observability::Event::Log(
+                                    ferron_observability::LogEvent {
+                                        level: ferron_observability::LogLevel::Warn,
+                                        message: format!(
+                                            "Reverse proxy: HTTP upgrade tunneling failed: {}",
+                                            e
+                                        ),
+                                        summary: "Reverse proxy: HTTP upgrade tunneling failed"
+                                            .into(),
+                                        target: "ferron-http-proxy",
+                                        attributes: upstream_attrs,
+                                        trace_context,
+                                    },
+                                ));
+                            }
+                            // Connection not returned to pool for upgrades
+                            // (upgrade connections are long-lived, not pooled)
+                        }
+                        None => {
+                            events.emit(ferron_observability::Event::Log(
+                                ferron_observability::LogEvent {
+                                    level: ferron_observability::LogLevel::Warn,
+                                    message: "Reverse proxy: backend HTTP upgrade failed"
+                                        .to_string(),
+                                    summary: "Reverse proxy: backend HTTP upgrade failed".into(),
+                                    target: "ferron-http-proxy",
+                                    attributes: upstream_attrs,
+                                    trace_context,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let mut upstream_attrs = upstream_attrs;
+                upstream_attrs.push((
+                    "error.message",
+                    ferron_observability::LogAttributeValue::String(e.to_string()),
+                ));
+                events.emit(ferron_observability::Event::Log(
+                    ferron_observability::LogEvent {
+                        level: ferron_observability::LogLevel::Warn,
+                        message: format!("Reverse proxy: frontend HTTP upgrade failed: {e}"),
+                        summary: "Reverse proxy: frontend HTTP upgrade failed".into(),
+                        target: "ferron-http-proxy",
+                        attributes: upstream_attrs,
+                        trace_context,
+                    },
+                ));
+            }
+        }
+    });
+
+    Ok(())
+}

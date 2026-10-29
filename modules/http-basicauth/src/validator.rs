@@ -1,0 +1,351 @@
+use std::collections::HashMap;
+
+use ferron_core::config::validator::{
+    entry_span, first_entry_span, ConfigurationValidationError, ConfigurationValidator,
+};
+use ferron_core::config::{
+    ServerConfigurationBlock, ServerConfigurationDirectiveEntry, ServerConfigurationValue,
+};
+use ferron_core::validate_directive;
+
+/// Recognized directives inside a `basic_auth { ... }` block.
+const BASICAUTH_DIRECTIVES: &[&str] = &["realm", "users", "brute_force_protection"];
+
+/// Recognized directives inside a `brute_force_protection { ... }` block.
+const BRUTE_FORCE_DIRECTIVES: &[&str] = &["max_attempts", "lockout_duration", "window"];
+
+/// Validator for `basic_auth` configuration blocks.
+#[derive(Default)]
+pub struct BasicAuthValidator;
+
+impl ConfigurationValidator for BasicAuthValidator {
+    fn validate_block(
+        &self,
+        config: &ServerConfigurationBlock,
+        ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        let is_global = ctx.is_global;
+        if is_global {
+            validate_directive!(config, ctx.used_directives, basic_auth_concurrency, args(1) => [ServerConfigurationValue::Number(_, _) | ServerConfigurationValue::Boolean(false, _)], {});
+            if let Some(entries) = config.directives.get("basic_auth_concurrency") {
+                for entry in entries {
+                    if matches!(
+                        entry.args.first(),
+                        Some(ServerConfigurationValue::Boolean(false, _))
+                    ) {
+                        ctx.add_best_practice_violation(
+                            "`basic_auth_concurrency false` disables the global password-verification concurrency limit; keep a bounded limit to prevent expensive hash checks from exhausting resources",
+                            entry_span(entry),
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(entries) = config.directives.get("basic_auth") {
+            ctx.used_directives.insert("basic_auth".to_string());
+            for entry in entries {
+                if let Some(ref children) = entry.children {
+                    self.validate_basic_auth_block(children, ctx)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Returns `true` when `value` can be sent as an HTTP header value.
+///
+/// A `realm` is interpolated into an authentication challenge, so it must not
+/// contain control bytes or line breaks.
+#[inline]
+fn is_valid_header_value(value: &str) -> bool {
+    http::HeaderValue::from_str(value).is_ok()
+}
+
+impl BasicAuthValidator {
+    fn validate_basic_auth_block(
+        &self,
+        block: &ServerConfigurationBlock,
+        ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        let mut sub = std::collections::HashSet::new();
+
+        for directive_name in block.directives.keys() {
+            if !BASICAUTH_DIRECTIVES.contains(&directive_name.as_str()) {
+                return Err(ConfigurationValidationError::from(format!(
+                    "Invalid `{directive_name}` — unknown directive in basic_auth block. \
+                     Recognized directives: realm, users, brute_force_protection"
+                ))
+                .with_span(first_entry_span(block, directive_name)));
+            }
+        }
+
+        if let Some(entries) = block.directives.get("realm") {
+            sub.insert("realm".to_string());
+            for entry in entries {
+                self.validate_single_string_entry(entry, "realm")?;
+            }
+        }
+
+        let users_entries = block.directives.get("users");
+        if users_entries.is_none() {
+            return Err(ConfigurationValidationError::from(
+                "Invalid `basic_auth` — missing required `users` block",
+            )
+            .with_span(block.span.clone()));
+        }
+
+        for users_entry in users_entries.into_iter().flatten() {
+            if let Some(ref users_block) = users_entry.children {
+                self.validate_users_block(users_block, ctx)?;
+            } else {
+                return Err(ConfigurationValidationError::from(
+                    "Invalid `basic_auth` — `users` must be a block form: `users {{ ... }}`",
+                )
+                .with_span(entry_span(users_entry)));
+            }
+        }
+        sub.insert("users".to_string());
+
+        if let Some(bfp_entries) = block.directives.get("brute_force_protection") {
+            sub.insert("brute_force_protection".to_string());
+            for bfp_entry in bfp_entries {
+                let enabled = bfp_entry.get_flag();
+                if !enabled {
+                    ctx.add_best_practice_violation(
+                        "`brute_force_protection false` disables credential-guessing protection; \
+                        only disable it when equivalent protection exists at another layer",
+                        entry_span(bfp_entry),
+                    );
+                }
+                if let Some(ref bfp_block) = bfp_entry.children {
+                    self.validate_brute_force_block(bfp_block, ctx)?;
+                }
+            }
+        }
+
+        ferron_core::check_unused_subdirectives!(
+            block,
+            sub,
+            &mut ctx.diagnostics,
+            ctx.scope.clone()
+        );
+        Ok(())
+    }
+
+    fn validate_users_block(
+        &self,
+        block: &ServerConfigurationBlock,
+        ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        if block.directives.is_empty() {
+            return Err(ConfigurationValidationError::from(
+                "Invalid `basic_auth` — `users` block must contain at least one user",
+            )
+            .with_span(block.span.clone()));
+        }
+
+        for (username, entries) in block.directives.iter() {
+            for entry in entries {
+                self.validate_single_string_entry(entry, &format!("user '{username}'"))?;
+
+                if let Some(value) = entry.args.first() {
+                    if let Some(hash_str) = value.as_str() {
+                        Self::validate_password_hash(hash_str, username)?;
+                        if !hash_str.starts_with("$argon2id$") {
+                            ctx.add_best_practice_violation(
+                                format!(
+                                    "Password hash for user '{username}' does not use Argon2id; prefer Argon2id for new Basic Auth credentials"
+                                ),
+                                entry_span(entry),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_password_hash(
+        hash: &str,
+        username: &str,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        #[cfg(not(feature = "fips"))]
+        let is_valid = hash.starts_with("$argon2id$")
+            || hash.starts_with("$argon2i$")
+            || hash.starts_with("$argon2d$")
+            || hash.starts_with("$pbkdf2$")
+            || hash.starts_with("$pbkdf2-sha256$")
+            || hash.starts_with("$pbkdf2-sha384$")
+            || hash.starts_with("$pbkdf2-sha512$")
+            || hash.starts_with("$scrypt$")
+            || hash.starts_with("$2a$")
+            || hash.starts_with("$2b$")
+            || hash.starts_with("$2x$")
+            || hash.starts_with("$2y$");
+        // STUB: Intentional FIPS stub allowlist. Only FIPS-compliant PBKDF2 variants
+        // are accepted under `fips`; the full allowlist is the `#[cfg(not(feature = "fips"))]`
+        // variant above.
+        #[cfg(feature = "fips")]
+        let is_valid = hash.starts_with("$pbkdf2-sha256$")
+            || hash.starts_with("$pbkdf2-sha384$")
+            || hash.starts_with("$pbkdf2-sha512$");
+
+        if !is_valid {
+            #[cfg(not(feature = "fips"))]
+            return Err(ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — password for user '{username}' must be a hashed value. \
+                 Supported formats: Argon2 ($argon2id$, $argon2i$, $argon2d$), \
+                 PBKDF2 ($pbkdf2$, $pbkdf2-sha256$, $pbkdf2-sha384$, $pbkdf2-sha512$), \
+                 bcrypt ($2a$, $2b$, $2x$, $2y$), \
+                 or scrypt ($scrypt$). \
+                 Plaintext passwords are not allowed for security reasons."
+            )));
+            #[cfg(feature = "fips")]
+            return Err(ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — password for user '{username}' must be a hashed value. \
+                 Supported formats: PBKDF2 ($pbkdf2-sha256$, $pbkdf2-sha384$, $pbkdf2-sha512$). \
+                 Plaintext passwords are not allowed for security reasons."
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_brute_force_block(
+        &self,
+        block: &ServerConfigurationBlock,
+        ctx: &mut ferron_core::config::validator::ConfigurationValidatorContext,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        let mut sub = std::collections::HashSet::new();
+
+        for directive_name in block.directives.keys() {
+            if !BRUTE_FORCE_DIRECTIVES.contains(&directive_name.as_str()) {
+                return Err(ConfigurationValidationError::from(format!(
+                    "Invalid `{directive_name}` — unknown directive in brute_force_protection block. \
+                     Recognized directives: max_attempts, lockout_duration, window"
+                ))
+                .with_span(first_entry_span(block, directive_name)));
+            }
+        }
+
+        if let Some(entries) = block.directives.get("max_attempts") {
+            sub.insert("max_attempts".to_string());
+            for entry in entries {
+                self.validate_positive_number_entry(entry, "max_attempts")?;
+            }
+        }
+
+        if let Some(entries) = block.directives.get("lockout_duration") {
+            sub.insert("lockout_duration".to_string());
+            for entry in entries {
+                self.validate_duration_entry(entry, "lockout_duration")?;
+            }
+        }
+
+        if let Some(entries) = block.directives.get("window") {
+            sub.insert("window".to_string());
+            for entry in entries {
+                self.validate_duration_entry(entry, "window")?;
+            }
+        }
+
+        ferron_core::check_unused_subdirectives!(
+            block,
+            sub,
+            &mut ctx.diagnostics,
+            ctx.scope.clone()
+        );
+        Ok(())
+    }
+
+    /// Validate that an entry has exactly one string argument.
+    fn validate_single_string_entry(
+        &self,
+        entry: &ServerConfigurationDirectiveEntry,
+        name: &str,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        let value = entry.args.first().ok_or_else(|| {
+            ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — {name} must have a value"
+            ))
+            .with_span(entry_span(entry))
+        })?;
+
+        let Some(resolved) = value.as_string_with_interpolations(&HashMap::new()) else {
+            return Err(ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — {name} must be a string value"
+            ))
+            .with_span(entry_span(entry)));
+        };
+
+        // The value is embedded in a `WWW-Authenticate` or `Proxy-Authenticate`
+        // challenge, so it must be usable as a header value.
+        if !is_valid_header_value(&resolved) {
+            return Err(ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — {name} is not a valid authentication challenge header \
+                 value; it must not contain control bytes or line breaks"
+            ))
+            .with_span(entry_span(entry)));
+        }
+
+        Ok(())
+    }
+
+    /// Validate that an entry has exactly one positive number argument.
+    fn validate_positive_number_entry(
+        &self,
+        entry: &ServerConfigurationDirectiveEntry,
+        name: &str,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        let value = entry.args.first().ok_or_else(|| {
+            ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — {name} must have a value"
+            ))
+            .with_span(entry_span(entry))
+        })?;
+
+        let n = value.as_number().ok_or_else(|| {
+            ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — {name} must be an integer value"
+            ))
+            .with_span(entry_span(entry))
+        })?;
+
+        if n <= 0 {
+            return Err(ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — {name} must be a positive integer"
+            ))
+            .with_span(entry_span(entry)));
+        }
+
+        Ok(())
+    }
+
+    /// Validate that an entry has a duration string or number value.
+    fn validate_duration_entry(
+        &self,
+        entry: &ServerConfigurationDirectiveEntry,
+        name: &str,
+    ) -> Result<(), ferron_core::config::validator::ConfigurationValidationError> {
+        let value = entry.args.first().ok_or_else(|| {
+            ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — {name} must have a value"
+            ))
+            .with_span(entry_span(entry))
+        })?;
+
+        if value.as_str().is_none() && value.as_number().is_none() {
+            return Err(ConfigurationValidationError::from(format!(
+                "Invalid `basic_auth` — {name} must be a duration string (e.g., '15m', '1h') or a number"
+            ))
+            .with_span(entry_span(entry)));
+        }
+
+        Ok(())
+    }
+}

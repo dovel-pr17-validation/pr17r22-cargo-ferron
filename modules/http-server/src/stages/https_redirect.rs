@@ -1,0 +1,346 @@
+//! HTTPS redirect stage
+//!
+//! Redirects plain HTTP requests to their HTTPS equivalent when the server
+//! has TLS enabled (indicated by `ctx.https_port` being set) and the
+//! request arrived over an unencrypted connection.
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use ferron_core::pipeline::{PipelineError, Stage};
+use ferron_core::registry::StageConstraint;
+use ferron_http::span::HttpContextSpanExt;
+use ferron_http::{HttpContext, HttpResponse};
+use ferron_observability::{
+    Event, MetricAttributeValue, MetricEvent, MetricType, MetricValue, TraceAttributeValue,
+};
+use http::{HeaderValue, Response};
+use http_body_util::{BodyExt, Empty};
+
+pub struct HttpsRedirectStage;
+
+impl Default for HttpsRedirectStage {
+    #[inline]
+    fn default() -> Self {
+        Self
+    }
+}
+
+/// Build a full HTTPS URL from the current request context.
+fn build_https_url(ctx: &HttpContext) -> Option<String> {
+    let req = ctx.req.as_ref()?;
+    let https_port = ctx.https_port?;
+
+    // Determine the host: use the original Host header, then the ctx hostname,
+    // then fall back to the local address.
+    let host_req = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| ctx.hostname.clone())
+        .or_else(|| ctx.local_address.map(|a| a.ip().to_string()))
+        .unwrap_or_default();
+    let host = if let Some((host_split, port)) = host_req.rsplit_once(":") {
+        if port.parse::<u16>().is_ok() {
+            host_split.to_string()
+        } else {
+            host_req
+        }
+    } else {
+        host_req
+    };
+
+    let path_and_query_orig = ctx
+        .original_uri
+        .as_ref()
+        .map(|u| u.path_and_query())
+        .unwrap_or(req.uri().path_and_query());
+    let path_and_query = path_and_query_orig
+        .map(|pq| pq.as_str())
+        .unwrap_or(req.uri().path());
+
+    let authority = if https_port == 443 {
+        host
+    } else {
+        format!("{host}:{https_port}")
+    };
+
+    Some(format!("https://{authority}{path_and_query}"))
+}
+
+#[async_trait(?Send)]
+impl Stage<HttpContext> for HttpsRedirectStage {
+    #[inline]
+    fn name(&self) -> &str {
+        "https_redirect"
+    }
+
+    #[inline]
+    fn constraints(&self) -> Vec<StageConstraint> {
+        vec![
+            StageConstraint::After("headers".to_string()),
+            StageConstraint::After("client_ip_from_header".to_string()),
+        ]
+    }
+
+    #[inline]
+    async fn run(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        // Skip if:
+        // - no https_port configured (TLS not enabled for this listener)
+        // - already encrypted (came in over HTTPS)
+        // - X-Forwarded-Proto: https indicates proxy already handled TLS
+        // - listener port equals https_port (no separate HTTPS listener)
+        let https_port = match ctx.https_port {
+            Some(p) => p,
+            None => return Ok(true),
+        };
+        if ctx.encrypted || ctx.local_address.is_some_and(|a| a.port() == https_port) {
+            return Ok(true);
+        }
+
+        if let Some(req) = ctx.req.as_ref() {
+            if req
+                .headers()
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("https"))
+            {
+                return Ok(true);
+            }
+        }
+
+        // Check per-host configuration: `https_redirect false` disables the redirect
+        let redirect_enabled = ctx
+            .configuration
+            .get_value("https_redirect", false)
+            .and_then(|v| v.as_boolean())
+            .unwrap_or(true);
+
+        if !redirect_enabled {
+            return Ok(true);
+        }
+
+        let Some(https_url) = build_https_url(ctx) else {
+            return Ok(true);
+        };
+
+        let location = HeaderValue::from_str(&https_url)
+            .map_err(|e| PipelineError::custom(format!("Invalid redirect URL: {e}")))?;
+
+        ctx.res = Some(HttpResponse::Custom(
+            Response::builder()
+                .status(308) // Permanent Redirect preserves method and body
+                .header(http::header::LOCATION, location)
+                .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync())
+                .expect("Failed to build 308 redirect response"),
+        ));
+        ctx.events.emit(Event::Metric(MetricEvent {
+            name: "ferron.http.server.redirects",
+            attributes: vec![
+                ("http.response.status_code", MetricAttributeValue::I64(308)),
+                (
+                    "ferron.http.redirect.reason",
+                    MetricAttributeValue::StaticStr("https_redirect"),
+                ),
+            ],
+            ty: MetricType::Counter,
+            value: MetricValue::U64(1),
+            unit: Some("{redirect}"),
+            description: Some("Number of HTTP redirects emitted by the server."),
+            trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+        }));
+
+        ctx.get_span_attributes().insert(
+            "ferron.redirect.target",
+            TraceAttributeValue::String(https_url),
+        );
+
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferron_core::config::layer::LayeredConfiguration;
+    use ferron_core::config::{
+        ServerConfigurationBlock, ServerConfigurationDirectiveEntry, ServerConfigurationValue,
+    };
+    use ferron_http::HttpRequest;
+    use ferron_observability::CompositeEventSink;
+    use http::Request;
+    use http_body_util::Empty;
+    use rustc_hash::FxHashMap as StdHashMap;
+    use std::sync::Arc;
+
+    fn make_test_context(
+        host_header: Option<&str>,
+        encrypted: bool,
+        https_port: Option<u16>,
+        hostname: Option<String>,
+    ) -> HttpContext {
+        let mut builder = Request::builder().uri("/path?query=1");
+        if let Some(h) = host_header {
+            builder = builder.header(http::header::HOST, h);
+        }
+        let req: HttpRequest = builder
+            .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync())
+            .unwrap();
+
+        let mut ctx = HttpContext::default();
+        ctx.req = Some(req);
+        ctx.events = CompositeEventSink::new(Vec::new());
+        ctx.configuration = LayeredConfiguration::default();
+        ctx.hostname = hostname;
+        ctx.encrypted = encrypted;
+        ctx.local_address = Some("0.0.0.0:80".parse().unwrap());
+        ctx.remote_address = Some("127.0.0.1:12345".parse().unwrap());
+        ctx.https_port = https_port;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn redirects_http_to_https() {
+        let mut ctx = make_test_context(
+            Some("example.com"),
+            false,
+            Some(443),
+            Some("example.com".to_string()),
+        );
+        let stage = HttpsRedirectStage;
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(!result, "should stop the pipeline");
+        if let Some(HttpResponse::Custom(resp)) = ctx.res {
+            assert_eq!(resp.status(), 308);
+            assert_eq!(
+                resp.headers()[http::header::LOCATION],
+                "https://example.com/path?query=1"
+            );
+        } else {
+            panic!("Expected redirect response");
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_when_already_encrypted() {
+        let mut ctx = make_test_context(Some("example.com"), true, Some(443), None);
+        let stage = HttpsRedirectStage;
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(result, "should continue pipeline");
+        assert!(ctx.res.is_none());
+    }
+
+    #[tokio::test]
+    async fn skips_when_no_https_port() {
+        let mut ctx = make_test_context(Some("example.com"), false, None, None);
+        let stage = HttpsRedirectStage;
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(result, "should continue pipeline");
+        assert!(ctx.res.is_none());
+    }
+
+    #[tokio::test]
+    async fn respects_x_forwarded_proto() {
+        let mut ctx = make_test_context(Some("example.com"), false, Some(443), None);
+        // Inject X-Forwarded-Proto header
+        if let Some(ref mut req) = ctx.req {
+            let (mut parts, body) = std::mem::replace(
+                req,
+                Request::builder()
+                    .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync())
+                    .unwrap(),
+            )
+            .into_parts();
+            parts
+                .headers
+                .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            *req = Request::from_parts(parts, body);
+        }
+        let stage = HttpsRedirectStage;
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(result, "should continue pipeline due to X-Forwarded-Proto");
+        assert!(ctx.res.is_none());
+    }
+
+    #[tokio::test]
+    async fn uses_non_standard_port() {
+        let mut ctx = make_test_context(
+            Some("example.com"),
+            false,
+            Some(8443),
+            Some("example.com".to_string()),
+        );
+        let stage = HttpsRedirectStage;
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(!result);
+        if let Some(HttpResponse::Custom(resp)) = ctx.res {
+            assert_eq!(
+                resp.headers()[http::header::LOCATION],
+                "https://example.com:8443/path?query=1"
+            );
+        } else {
+            panic!("Expected redirect response");
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_by_config() {
+        let mut ctx = make_test_context(Some("example.com"), false, Some(443), None);
+        // Simulate https_redirect false in configuration
+        let mut directives = StdHashMap::default();
+        directives.insert(
+            "https_redirect".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![ServerConfigurationValue::Boolean(false, None)],
+                children: None,
+                span: None,
+            }],
+        );
+        ctx.configuration
+            .add_layer(Arc::new(ServerConfigurationBlock {
+                directives: Arc::new(directives),
+                matchers: StdHashMap::default(),
+                span: None,
+            }));
+
+        let stage = HttpsRedirectStage;
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(result, "should continue when redirect is disabled");
+        assert!(ctx.res.is_none());
+    }
+
+    #[tokio::test]
+    async fn redirects_localhost_hostname_to_https() {
+        // Localhost can now have HTTPS with the local TLS provider, so it should be redirected
+        for hostname in &["localhost", "127.0.0.1", "::1"] {
+            let mut ctx =
+                make_test_context(Some(hostname), false, Some(443), Some(hostname.to_string()));
+            let stage = HttpsRedirectStage;
+            let result = stage.run(&mut ctx).await.unwrap();
+            assert!(
+                !result,
+                "should redirect localhost hostname to HTTPS: {hostname}"
+            );
+            if let Some(HttpResponse::Custom(resp)) = ctx.res {
+                assert_eq!(resp.status(), 308);
+            } else {
+                panic!("Expected redirect response for localhost");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_when_listener_port_equals_https_port() {
+        // Simulates explicit port config where no separate HTTPS listener exists
+        let mut ctx = make_test_context(Some("example.com"), false, Some(8080), None);
+        // local_address port is 8080 (same as https_port)
+        ctx.local_address = Some("0.0.0.0:8080".parse().unwrap());
+        let stage = HttpsRedirectStage;
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(
+            result,
+            "should continue when listener port equals https_port"
+        );
+        assert!(ctx.res.is_none());
+    }
+}

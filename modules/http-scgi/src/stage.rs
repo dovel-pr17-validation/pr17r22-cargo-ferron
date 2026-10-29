@@ -1,0 +1,342 @@
+use std::time::Instant;
+
+use ferron_core::pipeline::{PipelineError, Stage};
+use ferron_http::access_log::{custom_access_log_fields, CustomAccessLogField};
+use ferron_http::span::HttpContextSpanExt;
+use ferron_http::{HttpContext, HttpResponse};
+use ferron_observability::{
+    Event, LogAttributeValue, LogEvent, MetricAttributeValue, MetricEvent, MetricType, MetricValue,
+    TraceAttributeValue,
+};
+use http::Response;
+use http_body_util::BodyExt;
+use zincio_cegla::ZincioScgiRuntime;
+
+use crate::config::ScgiConfiguration;
+use crate::util::{ConnectedSocket, SendWrapBody};
+
+pub struct ScgiStage;
+
+#[async_trait::async_trait(?Send)]
+impl Stage<HttpContext> for ScgiStage {
+    fn name(&self) -> &str {
+        "scgi"
+    }
+
+    fn constraints(&self) -> Vec<ferron_core::registry::StageConstraint> {
+        vec![
+            ferron_core::registry::StageConstraint::Before("reverse_proxy".to_string()),
+            ferron_core::registry::StageConstraint::After("forward_proxy".to_string()),
+        ]
+    }
+
+    fn is_applicable(
+        &self,
+        config: Option<&ferron_core::config::ServerConfigurationBlock>,
+    ) -> bool {
+        config.is_some_and(|b| b.has_directive("scgi"))
+    }
+
+    async fn run(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        // -- check if SCGI is applicable
+        let Some(config) = ScgiConfiguration::from_http_ctx(ctx) else {
+            // SCGI not configured
+            return Ok(true);
+        };
+
+        let Some(mut request) = ctx.req.take() else {
+            // Request struct not found
+            return Ok(true);
+        };
+
+        // -- set environment variables --
+
+        // Remove "Proxy" header from the request to prevent "httpoxy" vulnerability
+        request
+            .headers_mut()
+            .remove(http::header::HeaderName::from_static("proxy"));
+
+        // Inject trace context into the request environment
+        if let Some(tc) = ctx.get::<ferron_http::trace_context::TraceContextKey>() {
+            ferron_http::trace_context::inject_trace_headers(request.headers_mut(), tc);
+        }
+
+        let original_request_uri = ctx.original_uri.as_ref().unwrap_or(request.uri());
+        let mut env_builder = cegla_scgi::client::CgiBuilder::new();
+
+        if let Some(auth_user) = ctx.auth_user.as_deref() {
+            let authorization_type = if let Some(authorization_value) = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                let mut authorization_value_split = authorization_value.split_whitespace();
+                authorization_value_split
+                    .next()
+                    .map(|authorization_type| authorization_type.to_string())
+            } else {
+                None
+            };
+            env_builder = env_builder.auth(authorization_type, auth_user.to_string());
+        }
+
+        if let Some(server_administrator_email) = ctx
+            .configuration
+            .get_value("admin_email", true)
+            .and_then(|v| v.as_string_with_interpolations(ctx))
+        {
+            env_builder = env_builder.server_admin(server_administrator_email);
+        }
+
+        if ctx.encrypted {
+            env_builder = env_builder.https();
+        }
+
+        env_builder = env_builder
+            .server("Ferron".to_string())
+            .request_uri(original_request_uri);
+
+        if let Some(addr) = ctx.local_address {
+            env_builder = env_builder.server_address(std::net::SocketAddr::new(
+                addr.ip().to_canonical(),
+                addr.port(),
+            ));
+        }
+        if let Some(addr) = ctx.remote_address {
+            env_builder = env_builder.client_address(std::net::SocketAddr::new(
+                addr.ip().to_canonical(),
+                addr.port(),
+            ));
+        }
+
+        if let Some(hostname) = ctx.hostname.clone() {
+            env_builder = env_builder.server(hostname);
+        }
+
+        for (env_var_key, env_var_value) in config.environment {
+            env_builder = env_builder.var(env_var_key, env_var_value);
+        }
+
+        // -- execute SCGI --
+        let scgi_to_fixed = if let Some(stripped) = config.backend_server.strip_prefix("unix:///") {
+            // hyper::Uri fails to parse a string if there is an empty authority, so add an "ignore" authority to Unix socket URLs
+            &format!("unix://ignore/{stripped}")
+        } else {
+            &config.backend_server
+        };
+
+        let request_start = Instant::now();
+
+        let scgi_to_url = scgi_to_fixed
+            .parse::<http::Uri>()
+            .map_err(|e| PipelineError::custom(e.to_string()))?;
+        let scheme_str = scgi_to_url.scheme_str();
+
+        let connected_socket = match scheme_str {
+            Some("tcp") => {
+                let host = match scgi_to_url.host() {
+                    Some(host) => host,
+                    None => {
+                        return Err(PipelineError::custom(
+                            "The SCGI URL doesn't include the host",
+                        ))
+                    }
+                };
+
+                let port = match scgi_to_url.port_u16() {
+                    Some(port) => port,
+                    None => {
+                        return Err(PipelineError::custom(
+                            "The SCGI URL doesn't include the port",
+                        ))
+                    }
+                };
+
+                let addr = format!("{host}:{port}");
+
+                match ConnectedSocket::connect_tcp(&addr).await {
+                    Ok(data) => data,
+                    Err(err) => match err.kind() {
+                        std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::HostUnreachable => {
+                            ctx.events.emit(Event::Log(LogEvent {
+                                level: ferron_observability::LogLevel::Error,
+                                message: format!("Service unavailable: {err}"),
+                                summary: "SCGI service unavailable".into(),
+                                target: "ferron-http-scgi",
+                                attributes: vec![(
+                                    "upstream.address",
+                                    LogAttributeValue::String(addr.clone()),
+                                )],
+                                trace_context:
+                                    ferron_http::trace_context::current_event_trace_context(ctx),
+                            }));
+                            ctx.events.emit(Event::Metric(MetricEvent {
+                                name: "ferron.scgi.failures",
+                                attributes: vec![
+                                    (
+                                        "error.type",
+                                        MetricAttributeValue::StaticStr("service_unavailable"),
+                                    ),
+                                    (
+                                        "ferron.scgi.backend_url",
+                                        MetricAttributeValue::String(scgi_to_fixed.to_string()),
+                                    ),
+                                ],
+                                ty: MetricType::Counter,
+                                value: MetricValue::U64(1),
+                                unit: Some("{request}"),
+                                description: Some(
+                                    "Number of SCGI requests that failed before a backend \
+                                    response was returned.",
+                                ),
+                                trace_context:
+                                    ferron_http::trace_context::current_event_trace_context(ctx),
+                            }));
+                            ctx.res = Some(HttpResponse::BuiltinError(503, None));
+                            ctx.get_span_attributes().insert(
+                                "error.type",
+                                TraceAttributeValue::StaticStr("service_unavailable"),
+                            );
+                            ctx.get_span_attributes()
+                                .insert("http.response.status_code", TraceAttributeValue::I64(503));
+                            ctx.get_span_attributes().insert(
+                                "ferron.scgi.backend_url",
+                                TraceAttributeValue::String(scgi_to_fixed.to_string()),
+                            );
+                            custom_access_log_fields(ctx).insert(
+                                "ferron.scgi.backend_url".into(),
+                                CustomAccessLogField::String(scgi_to_fixed.to_string()),
+                            );
+                            return Ok(true);
+                        }
+                        _ => return Err(PipelineError::custom(err.to_string())),
+                    },
+                }
+            }
+            Some("unix") => {
+                let path = scgi_to_url.path();
+                match ConnectedSocket::connect_unix(path).await {
+                    Ok(data) => data,
+                    Err(err) => match err.kind() {
+                        std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::HostUnreachable => {
+                            ctx.events.emit(Event::Log(LogEvent {
+                                level: ferron_observability::LogLevel::Error,
+                                message: format!("Service unavailable: {err}"),
+                                summary: "SCGI service unavailable".into(),
+                                target: "ferron-http-scgi",
+                                attributes: vec![(
+                                    "upstream.address",
+                                    LogAttributeValue::String(path.to_string()),
+                                )],
+                                trace_context:
+                                    ferron_http::trace_context::current_event_trace_context(ctx),
+                            }));
+                            ctx.events.emit(Event::Metric(MetricEvent {
+                                name: "ferron.scgi.failures",
+                                attributes: vec![
+                                    (
+                                        "error.type",
+                                        MetricAttributeValue::StaticStr("service_unavailable"),
+                                    ),
+                                    (
+                                        "ferron.scgi.backend_url",
+                                        MetricAttributeValue::String(scgi_to_fixed.to_string()),
+                                    ),
+                                ],
+                                ty: MetricType::Counter,
+                                value: MetricValue::U64(1),
+                                unit: Some("{request}"),
+                                description: Some(
+                                    "Number of SCGI requests that failed before a backend \
+                                    response was returned.",
+                                ),
+                                trace_context:
+                                    ferron_http::trace_context::current_event_trace_context(ctx),
+                            }));
+                            ctx.res = Some(HttpResponse::BuiltinError(503, None));
+                            ctx.get_span_attributes().insert(
+                                "error.type",
+                                TraceAttributeValue::StaticStr("service_unavailable"),
+                            );
+                            ctx.get_span_attributes()
+                                .insert("http.response.status_code", TraceAttributeValue::I64(503));
+                            ctx.get_span_attributes().insert(
+                                "ferron.scgi.backend_url",
+                                TraceAttributeValue::String(scgi_to_fixed.to_string()),
+                            );
+                            custom_access_log_fields(ctx).insert(
+                                "ferron.scgi.backend_url".into(),
+                                CustomAccessLogField::String(scgi_to_fixed.to_string()),
+                            );
+                            return Ok(false);
+                        }
+                        _ => return Err(PipelineError::custom(err.to_string())),
+                    },
+                }
+            }
+            _ => {
+                return Err(PipelineError::custom(
+                    "Only TCP and Unix socket URLs are supported.",
+                ))
+            }
+        };
+
+        let response = cegla_scgi::client::client_handle_scgi(
+            request,
+            ZincioScgiRuntime,
+            connected_socket,
+            env_builder,
+        )
+        .await
+        .map_err(|e| PipelineError::custom(e.to_string()))?;
+
+        let (parts, body) = response.into_parts();
+        let response = Response::from_parts(parts, SendWrapBody::new(body).boxed_unsync());
+
+        // SCGI response
+        let status_code = response.status().as_u16();
+        ctx.res = Some(HttpResponse::Custom(response));
+
+        let upstream_duration = request_start.elapsed().as_secs_f64();
+        ctx.events.emit(Event::Metric(MetricEvent {
+            name: "ferron.scgi.upstream.duration",
+            attributes: vec![(
+                "ferron.scgi.backend_url",
+                MetricAttributeValue::String(scgi_to_fixed.to_string()),
+            )],
+            ty: MetricType::Histogram(None),
+            value: MetricValue::F64(upstream_duration),
+            unit: Some("s"),
+            description: Some("Duration of SCGI upstream request processing."),
+            trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+        }));
+        ctx.events.emit(Event::Metric(MetricEvent {
+            name: "ferron.scgi.requests",
+            attributes: vec![],
+            ty: MetricType::Counter,
+            value: MetricValue::U64(1),
+            unit: Some("{request}"),
+            description: Some("Number of SCGI requests processed."),
+            trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+        }));
+
+        ctx.get_span_attributes().insert(
+            "http.response.status_code",
+            TraceAttributeValue::I64(status_code as i64),
+        );
+        ctx.get_span_attributes().insert(
+            "ferron.scgi.backend_url",
+            TraceAttributeValue::String(scgi_to_fixed.to_string()),
+        );
+        custom_access_log_fields(ctx).insert(
+            "ferron.scgi.backend_url".into(),
+            CustomAccessLogField::String(scgi_to_fixed.to_string()),
+        );
+
+        Ok(false)
+    }
+}

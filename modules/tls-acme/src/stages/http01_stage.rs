@@ -1,0 +1,101 @@
+//! HTTP-01 ACME challenge stage.
+//!
+//! Intercepts requests to `/.well-known/acme-challenge/<token>` and serves
+//! the corresponding key authorization from the shared ACME challenge locks.
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use ferron_core::pipeline::{PipelineError, Stage};
+use ferron_core::registry::StageConstraint;
+use ferron_http::{HttpContext, HttpResponse};
+use http::Response;
+use http_body_util::{BodyExt, Full};
+
+use crate::challenge::http01::try_handle_challenge;
+use crate::get_or_init_task_state;
+
+/// Stage that handles HTTP-01 ACME challenge requests.
+pub struct AcmeHttp01ChallengeStage;
+
+impl Default for AcmeHttp01ChallengeStage {
+    #[inline]
+    fn default() -> Self {
+        Self
+    }
+}
+
+#[async_trait(?Send)]
+impl Stage<HttpContext> for AcmeHttp01ChallengeStage {
+    #[inline]
+    fn name(&self) -> &str {
+        "acme_http01"
+    }
+
+    fn constraints(&self) -> Vec<StageConstraint> {
+        // Run very early in the pipeline, before other request handlers
+        vec![
+            StageConstraint::Before("https_redirect".to_string()),
+            StageConstraint::Before("client_ip_from_header".to_string()),
+        ]
+    }
+
+    #[inline]
+    async fn run(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        let Some(req) = ctx.req.as_ref() else {
+            return Ok(true);
+        };
+
+        let path = req.uri().path().to_string();
+
+        // Only handle ACME challenge paths
+        if !path.starts_with("/.well-known/acme-challenge/") {
+            return Ok(true);
+        }
+
+        // Look up the key authorization from the shared ACME state:
+        // first in-memory locks, then challenge files published by peers.
+        let task_state = get_or_init_task_state();
+        let key_authorization = {
+            let resolvers = task_state.http_01_resolvers.read().await;
+            try_handle_challenge(&path, &resolvers)
+        };
+        let key_authorization = match key_authorization {
+            Some(ka) => Some(ka),
+            None => {
+                let token = path
+                    .strip_prefix(crate::challenge::http01::ACME_CHALLENGE_PATH_PREFIX)
+                    .unwrap_or("");
+                let dirs = task_state.challenge_cache_dirs.read().await.clone();
+                let mut found = None;
+                for dir in &dirs {
+                    if let Some(ka) =
+                        crate::challenge_sync::load_http01_challenge_zincio(dir, token).await
+                    {
+                        found = Some(ka);
+                        break;
+                    }
+                }
+                found
+            }
+        };
+
+        if let Some(key_authorization) = key_authorization {
+            ctx.res = Some(HttpResponse::Custom(
+                Response::builder()
+                    .status(200)
+                    .header("Content-Type", "text/plain")
+                    .header("Content-Length", key_authorization.len())
+                    .body(
+                        Full::new(Bytes::from(key_authorization))
+                            .map_err(|e| match e {})
+                            .boxed_unsync(),
+                    )
+                    .expect("Failed to build ACME challenge response"),
+            ));
+            return Ok(false);
+        }
+
+        // No matching token found, let the pipeline continue (could eventually 404)
+        Ok(true)
+    }
+}

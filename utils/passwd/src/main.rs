@@ -1,0 +1,56 @@
+#[cfg(feature = "fips")]
+mod password_auth_fips;
+
+use clap::Parser;
+#[cfg(not(feature = "fips"))]
+use password_auth::generate_hash;
+#[cfg(feature = "fips")]
+use password_auth_fips::generate_hash;
+use rpassword::prompt_password;
+use std::process;
+
+/// A password tool for Ferron
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Read passwords from stdin (one password per line) instead of prompting the user.
+    #[arg(short, long)]
+    stdin: bool,
+}
+
+fn main() {
+    let args = Args::parse();
+    if args.stdin {
+        for password in std::io::stdin().lines() {
+            println!("{}", generate_hash(password.unwrap_or_default()));
+        }
+        return;
+    }
+
+    let password = match prompt_password("Password: ") {
+        Ok(pass) => pass,
+        Err(e) => {
+            eprintln!("Error reading password: {e}");
+            process::exit(1);
+        }
+    };
+    let password2 = match prompt_password("Confirm password: ") {
+        Ok(pass) => pass,
+        Err(e) => {
+            eprintln!("Error reading password confirmation: {e}");
+            process::exit(1);
+        }
+    };
+
+    if password != password2 {
+        eprintln!("Passwords don't match!");
+        process::exit(1);
+    }
+
+    let password_hash = generate_hash(password);
+
+    println!("The generated password hash: {password_hash}");
+    println!(
+    "Refer to the Ferron configuration documentation for information on how to configure the users with passwords"
+  )
+}

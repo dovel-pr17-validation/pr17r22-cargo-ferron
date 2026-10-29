@@ -1,0 +1,22 @@
+[package]
+name = "ferron-http-scgi"
+version = "3.0.0-rc.10"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+ferron-core = { path = "../../core" }
+ferron-http = { path = "../../types/http" }
+ferron-observability = { path = "../../types/observability" }
+http = "1"
+http-body-util = "0.1"
+zincio = { version = "0.2.22", features = ["fs"] }
+cegla-scgi = { version = "0.2.1", features = ["client"] }
+zincio-cegla = { version = "0.2.3", features = ["scgi-client"] }
+http-body = "1.0.1"
+send_wrapper = "0.6.0"
+tokio = "1.52.1"
+pin-project-lite = "0.2.17"
+
+[lints]
+workspace = true

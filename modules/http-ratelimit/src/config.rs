@@ -1,0 +1,392 @@
+//! Configuration parsing for `rate_limit` blocks.
+//!
+//! Parses `rate_limit { ... }` directive entries from the layered configuration
+//! into typed `RateLimitConfig` structures.
+
+use ferron_core::config::ServerConfigurationBlock;
+
+use crate::key_extractor::KeyExtractor;
+
+/// Identifies a rate limit zone, a sharing scope for token bucket registries.
+///
+/// Zones allow multiple hostnames to share the same rate limit registries,
+/// or to isolate them into separate per-host registries.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub enum RateLimitZoneId {
+    /// Shared global zone: all hosts without explicit zones share registries.
+    Global,
+    /// Named zone: hosts explicitly referencing the same name share registries.
+    Named(String),
+    /// Per-host zone: host has its own isolated registries.
+    Host(String),
+}
+
+/// Backend type for rate limiting state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendType {
+    /// Single-node in-memory buckets (default).
+    #[default]
+    Memory,
+    /// Distributed Redis/Valkey buckets.
+    Redis,
+}
+
+impl BackendType {
+    /// Parse from a `type` directive value.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "memory" => Some(Self::Memory),
+            "redis" | "valkey" => Some(Self::Redis),
+            _ => None,
+        }
+    }
+
+    /// Stable label for metrics and fingerprints.
+    pub fn label(&self) -> &'static str {
+        match self {
+            BackendType::Memory => "memory",
+            BackendType::Redis => "redis",
+        }
+    }
+}
+
+/// Backend configuration resolved from the layered `rate_limit_backend { ... }` block.
+///
+/// The block is a sibling of `rate_limit` (not nested inside it) and is
+/// inherited like other directives: a host/location without its own
+/// `rate_limit_backend` block inherits the global one. Absent entirely means memory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendConfig {
+    /// Selected backend type.
+    pub backend_type: BackendType,
+    /// Redis/Valkey URL (`redis://`, `rediss://`, `valkey://`).
+    pub url: String,
+    /// Prefix prepended to every Redis key.
+    pub key_prefix: String,
+    /// Per-request Redis timeout.
+    pub timeout: std::time::Duration,
+    /// On Redis errors, allow (`true`) or deny (`false`) the request.
+    pub fail_open: bool,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            backend_type: BackendType::Memory,
+            url: String::new(),
+            key_prefix: "ferron:rl:".to_string(),
+            timeout: std::time::Duration::from_millis(200),
+            fail_open: true,
+        }
+    }
+}
+
+impl BackendConfig {
+    /// Default Redis key prefix.
+    pub const DEFAULT_KEY_PREFIX: &'static str = "ferron:rl:";
+    /// Default Redis timeout in milliseconds.
+    pub const DEFAULT_TIMEOUT_MS: u64 = 200;
+
+    /// Stable fingerprint for engine cache keys.
+    pub fn fingerprint(&self) -> String {
+        match self.backend_type {
+            BackendType::Memory => "backend:memory".to_string(),
+            BackendType::Redis => format!(
+                "backend:redis|url:{}|prefix:{}|timeout:{}|fail_open:{}",
+                self.url,
+                self.key_prefix,
+                self.timeout.as_millis(),
+                self.fail_open
+            ),
+        }
+    }
+}
+
+/// Parse the effective `rate_limit_backend { ... }` block from layered configuration.
+///
+/// Uses the highest-priority `rate_limit_backend` entry (host/location overrides
+/// global). Returns the default memory config when no block exists.
+pub fn parse_backend_config(
+    config: &ferron_core::config::layer::LayeredConfiguration,
+) -> BackendConfig {
+    let Some(entry) = config.get_entry("rate_limit_backend", false) else {
+        return BackendConfig::default();
+    };
+    let Some(children) = entry.children.as_ref() else {
+        return BackendConfig::default();
+    };
+    parse_backend_block(children)
+}
+
+/// Parse a single `rate_limit_backend { ... }` block.
+fn parse_backend_block(block: &ServerConfigurationBlock) -> BackendConfig {
+    let backend_type = block
+        .get_value("type")
+        .and_then(|v| v.as_str())
+        .and_then(BackendType::from_str)
+        .unwrap_or_default();
+
+    let url = block
+        .get_value("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let key_prefix = block
+        .get_value("key_prefix")
+        .and_then(|v| v.as_str())
+        .unwrap_or(BackendConfig::DEFAULT_KEY_PREFIX)
+        .to_string();
+
+    let timeout = block
+        .get_value("timeout")
+        .and_then(parse_timeout_value)
+        .unwrap_or_else(|| std::time::Duration::from_millis(BackendConfig::DEFAULT_TIMEOUT_MS));
+
+    // `fail_open` defaults to true. Absent means true; present flag without
+    // args means true; explicit boolean is honored.
+    let fail_open = if block.directives.contains_key("fail_open") {
+        block.get_flag("fail_open")
+    } else {
+        true
+    };
+
+    BackendConfig {
+        backend_type,
+        url,
+        key_prefix,
+        timeout,
+        fail_open,
+    }
+}
+
+/// Parse a `timeout` value.
+///
+/// Accepts an integer as milliseconds (e.g. `timeout 200`), a float as
+/// seconds, or a duration string (e.g. `timeout "2s"`, `timeout "1m"`).
+/// Note: millisecond strings like `"200ms"` are not supported by the shared
+/// duration parser; use a plain number for milliseconds.
+fn parse_timeout_value(
+    value: &ferron_core::config::ServerConfigurationValue,
+) -> Option<std::time::Duration> {
+    if let Some(millis) = value.as_number() {
+        if millis < 0 {
+            return None;
+        }
+        return Some(std::time::Duration::from_millis(millis as u64));
+    }
+    // Floats and duration strings fall through to the shared parser
+    // (float = seconds, string = e.g. "2s").
+    value.as_duration()
+}
+
+/// A single rate limit rule parsed from configuration.
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    /// Sustained requests per second.
+    pub rate: u64,
+    /// Extra tokens above `rate` (bucket capacity = `rate + burst`).
+    pub burst: u64,
+    /// Strategy for extracting the rate limit key.
+    pub key: KeyExtractor,
+    /// HTTP status code to return when rate is exceeded.
+    pub deny_status: u16,
+    /// TTL for evicting stale buckets (seconds).
+    pub bucket_ttl_secs: u64,
+    /// Maximum number of buckets per rule (prevents unbounded memory growth).
+    pub max_buckets: usize,
+    /// Whether to throttle requests instead of rejecting them.
+    pub throttle: bool,
+    /// Opt back into per-request rejection debug logs (for forensics).
+    /// Defaults to `false`: only the first rejection per key per suppression
+    /// window is logged, since per-request logs can exhaust the
+    /// observability pipeline under rejection storms.
+    pub log_rejections: bool,
+}
+
+impl RateLimitZoneId {
+    /// Return a stable string label for use in metric attributes.
+    pub fn label(&self) -> &str {
+        match self {
+            RateLimitZoneId::Global => "global",
+            RateLimitZoneId::Named(name) => name.as_str(),
+            RateLimitZoneId::Host(host) => host.as_str(),
+        }
+    }
+}
+
+impl RateLimitConfig {
+    /// Default values for rate limit configuration.
+    pub const DEFAULT_BURST: u64 = 0;
+    pub const DEFAULT_DENY_STATUS: u16 = 429;
+    pub const DEFAULT_BUCKET_TTL_SECS: u64 = 600; // 10 minutes
+    pub const DEFAULT_MAX_BUCKETS: usize = 100_000;
+}
+
+/// Parse all `rate_limit` directives from the layered configuration.
+///
+/// Each `rate_limit { ... }` block becomes a `RateLimitConfig`.
+/// If no `rate_limit` blocks are present, returns an empty vec.
+pub fn parse_rate_limit_config(
+    config: &ferron_core::config::layer::LayeredConfiguration,
+) -> Vec<RateLimitConfig> {
+    let mut rules = Vec::new();
+
+    // rate_limit can appear as:
+    // 1. A block: `rate_limit { rate 100; burst 50 }`
+    // 2. Multiple blocks (repeatable, like `upstream`)
+    let entries = config.get_entries("rate_limit", true);
+
+    for entry in entries {
+        if let Some(children) = &entry.children {
+            if let Some(rule) = parse_rate_limit_block(children) {
+                rules.push(rule);
+            }
+        }
+    }
+
+    rules
+}
+
+/// Parse a single `rate_limit { ... }` block into a `RateLimitConfig`.
+fn parse_rate_limit_block(block: &ServerConfigurationBlock) -> Option<RateLimitConfig> {
+    // `rate` is required
+    let rate = block
+        .get_value("rate")
+        .and_then(|v| v.as_number())
+        .filter(|&n| n > 0)? as u64;
+
+    let burst = block
+        .get_value("burst")
+        .and_then(|v| v.as_number())
+        .filter(|&n| n >= 0)
+        .unwrap_or(RateLimitConfig::DEFAULT_BURST as i64) as u64;
+
+    let key_str = block
+        .get_value("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("remote_address");
+
+    let key = KeyExtractor::from_str(key_str).unwrap_or(KeyExtractor::RemoteAddress);
+
+    let deny_status = block
+        .get_value("deny_status")
+        .and_then(|v| v.as_number())
+        .filter(|&n| (100..=599).contains(&n))
+        .unwrap_or(RateLimitConfig::DEFAULT_DENY_STATUS as i64) as u16;
+
+    let bucket_ttl_secs = block
+        .get_value("bucket_ttl")
+        .and_then(|v| v.as_duration())
+        .map_or(RateLimitConfig::DEFAULT_BUCKET_TTL_SECS, |d| d.as_secs());
+
+    let max_buckets = block
+        .get_value("max_buckets")
+        .and_then(|v| v.as_number())
+        .filter(|&n| n > 0)
+        .unwrap_or(RateLimitConfig::DEFAULT_MAX_BUCKETS as i64) as usize;
+
+    let throttle = block.get_flag("throttle");
+
+    let log_rejections = block.get_flag("log_rejections");
+
+    Some(RateLimitConfig {
+        rate,
+        burst,
+        key,
+        deny_status,
+        bucket_ttl_secs,
+        max_buckets,
+        throttle,
+        log_rejections,
+    })
+}
+
+/// Parse the `zone` directive from a host-level `rate_limit` block.
+///
+/// Returns `Some(name)` if the block contains `zone "name"`, or `None` otherwise.
+pub fn parse_zone_name(block: &ServerConfigurationBlock) -> Option<String> {
+    block
+        .get_value("zone")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Check if a global `rate_limit` block exists without zone definitions.
+///
+/// Returns `true` if the global (first) layer has a `rate_limit` block
+/// that does NOT contain any `zone` directives, meaning all hosts share
+/// a global zone by default.
+pub fn has_global_zone(configuration: &ferron_core::config::layer::LayeredConfiguration) -> bool {
+    // Only check the global layer (first layer), not host layers
+    if let Some(global_layer) = configuration.layers.first() {
+        if let Some(entries) = global_layer.directives.get("rate_limit") {
+            for entry in entries {
+                if let Some(children) = &entry.children {
+                    if !children.directives.contains_key("zone") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if a host has its own `rate_limit` block (not inherited from global).
+///
+/// Returns `true` if the host-level configuration has a `rate_limit` block
+/// without a `zone` directive, meaning the host opts out of the global zone.
+pub fn has_own_rate_limit_block(
+    configuration: &ferron_core::config::layer::LayeredConfiguration,
+) -> bool {
+    // get_entries with inherit=false returns entries from the most recent layer
+    // that has the directive. If the host has its own rate_limit block, this
+    // returns the host's entries. If not, it falls back to global entries.
+    //
+    // To distinguish, we check if the LAST layer (host) has rate_limit entries.
+    if let Some(host_layer) = configuration.layers.last() {
+        if let Some(entries) = host_layer.directives.get("rate_limit") {
+            for entry in entries {
+                if let Some(children) = &entry.children {
+                    // Host has a rate_limit block. If it doesn't have a zone
+                    // directive, it's opting out of the global zone.
+                    if !children.directives.contains_key("zone") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Resolve the rate limit zone ID for a request based on configuration.
+///
+/// Resolution order:
+/// 1. Explicit `zone "name"` in host `rate_limit` block -> `Named(name)`
+/// 2. Host has its own `rate_limit` block (without zone) -> `Host(hostname)` (opt-out)
+/// 3. Global `rate_limit` block without zone definitions -> `Global`
+/// 4. Fallback -> `Host(hostname)`
+pub fn resolve_zone_id(
+    configuration: &ferron_core::config::layer::LayeredConfiguration,
+    hostname: &Option<String>,
+) -> RateLimitZoneId {
+    for entry in configuration.get_entries("rate_limit", false) {
+        if let Some(children) = &entry.children {
+            if let Some(name) = parse_zone_name(children) {
+                return RateLimitZoneId::Named(name);
+            }
+        }
+    }
+
+    if has_own_rate_limit_block(configuration) {
+        return RateLimitZoneId::Host(hostname.clone().unwrap_or_else(|| "_default".to_string()));
+    }
+
+    if has_global_zone(configuration) {
+        RateLimitZoneId::Global
+    } else {
+        RateLimitZoneId::Host(hostname.clone().unwrap_or_else(|| "_default".to_string()))
+    }
+}

@@ -1,0 +1,128 @@
+# Use the official Rust image as a build stage
+FROM --platform=$BUILDPLATFORM rust:trixie AS builder
+
+# Define ARGs for target and build platforms
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+
+# Custom ARGs
+ARG FIPS=0
+ARG NOPGO=0
+
+# Install packages for cross-compiling software
+RUN --mount=type=cache,sharing=locked,target=/var/cache/apt \
+    --mount=type=cache,sharing=locked,target=/var/lib/apt \
+    --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \
+    # Install packages for cross-compiling software
+    wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+      > /etc/apt/trusted.gpg.d/apt.llvm.org.asc && \
+    echo "deb http://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main" \
+      > /etc/apt/sources.list.d/llvm.list && \
+    echo "deb-src http://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main" \
+      >> /etc/apt/sources.list.d/llvm.list && \
+    apt update && DEBIAN_FRONTEND=noninteractive \
+    apt install -y debootstrap clang-23 lld-23 libclang-23-dev wrk \
+    nghttp2-client openssl python3 llvm-23 qemu-user-static cmake curl \
+    clang lld libclang-dev llvm && \
+    cargo install bindgen-cli
+
+# Install the right Rust target
+RUN \
+    # Determine the target
+    TARGET_TRIPLE="" && \
+    if ! [ "$BUILDPLATFORM" = "$TARGETPLATFORM" ]; then \
+    case "$TARGETPLATFORM" in \
+    "linux/386") TARGET_TRIPLE="i686-unknown-linux-musl";; \
+    "linux/amd64") TARGET_TRIPLE="x86_64-unknown-linux-musl";; \
+    "linux/arm64") TARGET_TRIPLE="aarch64-unknown-linux-musl";; \
+    "linux/arm/v7") TARGET_TRIPLE="armv7-unknown-linux-musleabihf";; \
+    "*") echo "Unsupported target platform for cross-compilation: $TARGETPLATFORM" && exit 1 ;; \
+    esac \
+    else \
+    TARGET_TRIPLE="$(rustc --print host-tuple | sed 's/gnu/musl/')"; \
+    fi && \
+    # Install the Rust target
+    rustup target add $TARGET_TRIPLE && \
+    # Save target triple
+    echo "$TARGET_TRIPLE" > /tmp/target_triple && \
+    # Create base port directory
+    mkdir -p /tmp/cross_build_baseport_cached
+
+RUN --mount=type=cache,sharing=locked,target=/tmp/cross_build_baseport_cached \
+    # Determine the base port
+    BASE_PORT="$(cat /tmp/cross_build_baseport_cached/base_port 2>&1 || true)" && \
+    # If base port is missing or greater than 32735 (32768 - 32 - 1), set to 18080,
+    # otherwise increment by 32
+    BASE_PORT="$(echo "$BASE_PORT" | awk '{print ($1 > 32735) ? 18080 : $1 + 32}')" && \
+    echo "$BASE_PORT" > /tmp/cross_build_baseport_cached/base_port && \
+    echo "$BASE_PORT" > /tmp/cross_build_baseport
+
+# Set the working directory
+WORKDIR /usr/src/ferron
+
+# Copy the source code
+COPY . .
+
+# Build the application and copy binaries to an accessible location
+RUN --mount=type=cache,sharing=private,target=/usr/local/cargo/git \
+    --mount=type=cache,sharing=private,target=/usr/local/cargo/registry \
+    --mount=type=cache,sharing=shared,target=/usr/src/ferron/target \
+    --mount=type=cache,sharing=shared,target=/usr/src/ferron/cross-build/sysroots/prepared \
+    # Set target triple and path
+    TARGET_TRIPLE="$(cat /tmp/target_triple)" && \
+    TARGET_PATH="target/$TARGET_TRIPLE/release" && \
+    # Prepare the sysroot with lockfile protection
+    flock -x /usr/src/ferron/cross-build/sysroots/prepared/prepare.lock \
+      ./cross-build/sysroots/prepare-musl.sh $TARGET_TRIPLE && \
+    # FIPS compliance check
+    FIPS_ADD_ARG="" && \
+    if [ "${FIPS}" == "1" ]; then \
+      FIPS_ADD_ARG="--fips"; \
+    fi && \
+    # Build Ferron binaries
+    # Check if PGO would be enabled based on target triple
+    if [ "${NOPGO}" != "1" ] && ([ "$TARGET_TRIPLE" = "x86_64-unknown-linux-musl" ] \
+        || [ "$TARGET_TRIPLE" = "aarch64-unknown-linux-musl" ]); then \
+      BENCH_BASE_PORT="$(cat /tmp/cross_build_baseport)" \
+      CLANG="clang-23" CLANGXX="clang++-23" LLVM_PROFDATA="llvm-profdata-23" \
+      ./cross-build/build.sh $TARGET_TRIPLE $FIPS_ADD_ARG --pgo; \
+    else \
+      # These targets would fail with PGO, due to missing libprofiler_builtins
+      BENCH_BASE_PORT="$(cat /tmp/cross_build_baseport)" \
+      CLANG="clang-23" CLANGXX="clang++-23" LLVM_PROFDATA="llvm-profdata-23" \
+      ./cross-build/build.sh $TARGET_TRIPLE $FIPS_ADD_ARG; \
+    fi && \
+    # Copy executables out of the cache
+    mkdir .dist && cp $TARGET_PATH/ferron $TARGET_PATH/ferron-fmt $TARGET_PATH/ferron-passwd $TARGET_PATH/ferron-precompress $TARGET_PATH/ferron-kdl2ferron $TARGET_PATH/ferron-serve .dist
+
+# Use a Distroless base image for the final image
+FROM gcr.io/distroless/static-debian13:nonroot
+
+# Copy the compiled binaries from the builder stage
+COPY --from=builder /usr/src/ferron/.dist /usr/local/bin
+
+# Switch to "nobody" user to make commands like WORKDIR use the correct owner
+USER nobody
+
+# Create :
+# - an ACME cache directory
+# - a directory where Ferron logs are stored
+# - a configuration directory
+WORKDIR /etc/ferron
+WORKDIR /etc/ferron/conf.d
+WORKDIR /var/cache/ferron-acme
+WORKDIR /var/log/ferron
+
+# Copy the web server configuration
+COPY --chown=nobody configs/ferron.docker-entrypoint.conf /etc/ferron/ferron.conf
+COPY --chown=nobody configs/ferron.docker.conf /etc/ferron/conf.d/00-default.conf
+
+# Copy the web root contents
+COPY --chown=nobody wwwroot /var/www/ferron/
+
+# Expose the port 80 (used for HTTP)
+EXPOSE 80
+
+# Set the command to run the binary
+CMD ["/usr/local/bin/ferron", "run", "-c", "/etc/ferron/ferron.conf"]

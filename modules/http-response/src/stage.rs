@@ -1,0 +1,844 @@
+//! HTTP response control pipeline stage.
+//!
+//! Evaluates `abort`, `block`/`allow`, and `status` directives
+//! to short-circuit requests before content handling.
+
+use std::sync::Arc;
+
+use crate::config::{ResponseConfig, StatusRule};
+use bytes::Bytes;
+use dashmap::DashMap;
+use ferron_core::pipeline::{PipelineError, Stage};
+use ferron_core::registry::StageConstraint;
+use ferron_http::access_log::{custom_access_log_fields, CustomAccessLogField};
+use ferron_http::span::HttpContextSpanExt;
+use ferron_http::trace_context::current_event_trace_context;
+use ferron_http::{HttpContext, HttpResponse};
+use ferron_observability::{
+    Event, LogAttributeValue, LogEvent, LogLevel, MetricAttributeValue, MetricEvent, MetricType,
+    MetricValue, TraceAttributeValue,
+};
+use http::header::LOCATION;
+use http::{HeaderMap, HeaderValue, Response, StatusCode};
+use http_body_util::{BodyExt, Empty, Full};
+use rustc_hash::FxBuildHasher;
+
+const LOG_TARGET: &str = "ferron-http-response";
+
+/// Shared state for the http-response module.
+pub struct ResponseEngine {
+    pub compiled_regexes: DashMap<String, Arc<regex::Regex>, FxBuildHasher>,
+}
+
+impl ResponseEngine {
+    pub fn new() -> Self {
+        Self {
+            compiled_regexes: DashMap::with_hasher(FxBuildHasher),
+        }
+    }
+}
+
+impl Default for ResponseEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Pipeline stage that enforces abort, IP access control, and custom status codes.
+pub struct HttpResponseStage {
+    engine: Arc<ResponseEngine>,
+}
+
+impl HttpResponseStage {
+    pub fn new(engine: Arc<ResponseEngine>) -> Self {
+        Self { engine }
+    }
+
+    fn evaluate_abort(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        let config = ResponseConfig::from_config(&ctx.configuration, &self.engine);
+        if config.abort.abort {
+            ctx.res = Some(HttpResponse::Abort);
+            ctx.events.emit(Event::Metric(MetricEvent {
+                name: "ferron.response.aborted",
+                attributes: vec![],
+                ty: MetricType::Counter,
+                value: MetricValue::U64(1),
+                unit: Some("{request}"),
+                description: Some("Connections aborted via the abort directive."),
+                trace_context: current_event_trace_context(ctx),
+            }));
+            ctx.get_span_attributes().insert(
+                "ferron.response.action",
+                TraceAttributeValue::StaticStr("abort"),
+            );
+            custom_access_log_fields(ctx).insert(
+                "ferron.response.action".into(),
+                CustomAccessLogField::String("abort".into()),
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn evaluate_ip_access(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        let config = ResponseConfig::from_config(&ctx.configuration, &self.engine);
+        let Some(remote) = ctx.remote_address else {
+            return Ok(true);
+        };
+        if config.ip_access.is_blocked(remote.ip()) {
+            ctx.res = Some(HttpResponse::BuiltinError(403, None));
+            ctx.events.emit(Event::Metric(MetricEvent {
+                name: "ferron.response.ip_blocked",
+                attributes: vec![],
+                ty: MetricType::Counter,
+                value: MetricValue::U64(1),
+                unit: Some("{request}"),
+                description: Some(
+                    "Connections blocked via block/allow directives (raw IPs not included).",
+                ),
+                trace_context: current_event_trace_context(ctx),
+            }));
+            ctx.get_span_attributes().insert(
+                "ferron.response.action",
+                TraceAttributeValue::StaticStr("block"),
+            );
+            ctx.get_span_attributes()
+                .insert("http.response.status_code", TraceAttributeValue::I64(403));
+            custom_access_log_fields(ctx).insert(
+                "ferron.response.action".into(),
+                CustomAccessLogField::String("block".into()),
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn evaluate_status_rules(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        let config = ResponseConfig::from_http_context(ctx, &self.engine);
+        if config.status_rules.is_empty() {
+            return Ok(true);
+        }
+
+        let request_path = match &ctx.routing_uri {
+            Some(uri) => uri.path().to_string(),
+            None => ctx
+                .req
+                .as_ref()
+                .map(|req| req.uri().path().to_string())
+                .unwrap_or_default(),
+        };
+
+        for (rule_index, rule) in config.status_rules.iter().enumerate() {
+            let Some(path_match) = Self::rule_matches(rule, &request_path) else {
+                continue;
+            };
+
+            let response = Self::build_response(rule, path_match)?;
+            ctx.res = Some(response);
+
+            ctx.events.emit(Event::Metric(MetricEvent {
+                name: "ferron.response.status_rule_matched",
+                attributes: vec![
+                    (
+                        "http.response.status_code",
+                        MetricAttributeValue::I64(rule.status_code as i64),
+                    ),
+                    (
+                        "ferron.rule_id",
+                        MetricAttributeValue::String(Self::rule_id(rule, rule_index)),
+                    ),
+                ],
+                ty: MetricType::Counter,
+                value: MetricValue::U64(1),
+                unit: Some("{request}"),
+                description: Some("Custom status codes returned via status directives."),
+                trace_context: current_event_trace_context(ctx),
+            }));
+
+            ctx.get_span_attributes().insert(
+                "ferron.response.action",
+                TraceAttributeValue::StaticStr("status"),
+            );
+            ctx.get_span_attributes().insert(
+                "http.response.status_code",
+                TraceAttributeValue::I64(rule.status_code as i64),
+            );
+            custom_access_log_fields(ctx).insert(
+                "ferron.response.action".into(),
+                CustomAccessLogField::String("status".into()),
+            );
+
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// Stable identifier for a matched status rule, surfaced as `ferron.rule_id`.
+    ///
+    /// Prefers an explicit `name` when the rule sets one; otherwise falls back
+    /// to the status code plus the 1-based position of the rule among the
+    /// evaluated `status` directives. The fallback deliberately avoids request
+    /// data (matched paths can vary per request), so metric labels stay
+    /// bounded. The previous behavior duplicated the status code, making
+    /// same-code rules indistinguishable.
+    fn rule_id(rule: &StatusRule, rule_index: usize) -> String {
+        if let Some(name) = rule.name.as_deref().filter(|name| !name.is_empty()) {
+            return name.to_string();
+        }
+        format!("status-{}-rule-{}", rule.status_code, rule_index + 1)
+    }
+
+    /// Check whether a status rule matches the given request path.
+    /// Returns matched text
+    fn rule_matches<'a>(rule: &StatusRule, path: &'a str) -> Option<&'a str> {
+        match (&rule.url, &rule.regex) {
+            // Neither url nor regex: match everything
+            (None, None) => Some(path),
+            // Only url: exact match
+            (Some(url), None) => {
+                if url == path {
+                    Some(path)
+                } else {
+                    None
+                }
+            }
+            // Only regex: regex match
+            (None, Some(regex)) => regex.find(path).map(|m| m.as_str()),
+            // Both url and regex: both must match
+            (Some(url), Some(regex)) => {
+                if url == path {
+                    regex.find(path).map(|m| m.as_str())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Build an HttpResponse from a matched status rule.
+    fn build_response(
+        rule: &StatusRule,
+        request_path: &str,
+    ) -> Result<HttpResponse, PipelineError> {
+        let status_code = StatusCode::from_u16(rule.status_code)
+            .map_err(|e| PipelineError::custom(e.to_string()))?;
+
+        // Handle redirects (3xx with location)
+        if (300..400).contains(&rule.status_code) {
+            if let Some(location) = &rule.location {
+                let location = if let Some(regex) = &rule.regex {
+                    regex.replace(request_path, location).to_string()
+                } else {
+                    location.clone()
+                };
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    LOCATION,
+                    HeaderValue::from_str(&location)
+                        .map_err(|e| PipelineError::custom(e.to_string()))?,
+                );
+
+                if let Some(body) = &rule.body {
+                    let body_bytes = Bytes::from(body.clone());
+                    let content_length = body_bytes.len();
+                    headers.insert(
+                        http::header::CONTENT_LENGTH,
+                        HeaderValue::from_str(&content_length.to_string())
+                            .expect("content length header value should be valid"),
+                    );
+
+                    let mut response = Response::builder()
+                        .status(status_code)
+                        .body(
+                            Full::new(body_bytes)
+                                .map_err(|e: std::convert::Infallible| match e {})
+                                .boxed_unsync(),
+                        )
+                        .map_err(|e| PipelineError::custom(e.to_string()))?;
+                    *response.headers_mut() = headers;
+
+                    return Ok(HttpResponse::Custom(response));
+                } else {
+                    let mut response = Response::builder()
+                        .status(status_code)
+                        .body(
+                            Empty::new()
+                                .map_err(|e: std::convert::Infallible| match e {})
+                                .boxed_unsync(),
+                        )
+                        .map_err(|e| PipelineError::custom(e.to_string()))?;
+                    *response.headers_mut() = headers;
+
+                    return Ok(HttpResponse::Custom(response));
+                }
+            }
+        }
+
+        // Non-redirect or redirect without location: return status + optional body
+        if let Some(body) = &rule.body {
+            let body_bytes = Bytes::from(body.clone());
+            let content_length = body_bytes.len();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_LENGTH,
+                HeaderValue::from_str(&content_length.to_string())
+                    .expect("content length header value should be valid"),
+            );
+
+            let response = Response::builder()
+                .status(status_code)
+                .body(
+                    Full::new(body_bytes)
+                        .map_err(|e: std::convert::Infallible| match e {})
+                        .boxed_unsync(),
+                )
+                .map_err(|e| PipelineError::custom(e.to_string()))?;
+
+            Ok(HttpResponse::Custom(response))
+        } else {
+            Ok(HttpResponse::BuiltinError(rule.status_code, None))
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Stage<HttpContext> for HttpResponseStage {
+    fn name(&self) -> &str {
+        "http_response"
+    }
+
+    fn constraints(&self) -> Vec<StageConstraint> {
+        vec![
+            StageConstraint::After("client_ip_from_header".to_string()),
+            StageConstraint::After("https_redirect".to_string()),
+            StageConstraint::Before("reverse_proxy".to_string()),
+        ]
+    }
+
+    fn is_applicable(
+        &self,
+        config: Option<&ferron_core::config::ServerConfigurationBlock>,
+    ) -> bool {
+        let Some(c) = config else { return false };
+        c.has_directive("abort")
+            || c.has_directive("block")
+            || c.has_directive("allow")
+            || c.has_directive("status")
+    }
+
+    #[inline]
+    async fn run(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        if !self.evaluate_abort(ctx)? {
+            return Ok(false);
+        }
+
+        if !self.evaluate_ip_access(ctx)? {
+            return Ok(false);
+        }
+
+        if !self.evaluate_status_rules(ctx)? {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+}
+
+/// Pipeline stage that sends 103 Early Hints responses.
+///
+/// This stage evaluates the `early_hints` directive and sends a 103 Early Hints
+/// response with the configured `Link` headers before the final response is ready.
+/// The stage never short-circuits the pipelin it always returns `Ok(true)`.
+pub struct EarlyHintsStage {
+    engine: Arc<ResponseEngine>,
+}
+
+impl EarlyHintsStage {
+    pub fn new(engine: Arc<ResponseEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Stage<HttpContext> for EarlyHintsStage {
+    fn name(&self) -> &str {
+        "early_hints"
+    }
+
+    fn constraints(&self) -> Vec<StageConstraint> {
+        vec![
+            StageConstraint::After("http_response".to_string()),
+            StageConstraint::Before("reverse_proxy".to_string()),
+        ]
+    }
+
+    fn is_applicable(
+        &self,
+        config: Option<&ferron_core::config::ServerConfigurationBlock>,
+    ) -> bool {
+        let Some(c) = config else { return false };
+        c.has_directive("early_hints")
+    }
+
+    async fn run(&self, ctx: &mut HttpContext) -> Result<bool, PipelineError> {
+        let config = crate::config::ResponseConfig::from_config(&ctx.configuration, &self.engine);
+        if config.early_hints.links.is_empty() {
+            return Ok(true);
+        }
+
+        let mut headers = HeaderMap::new();
+        for link in &config.early_hints.links {
+            if let Ok(value) = HeaderValue::from_str(link) {
+                headers.append(http::header::LINK, value);
+            }
+        }
+
+        if headers.is_empty() {
+            return Ok(true);
+        }
+
+        // Attempt to send 103 Early Hints. If it fails (e.g., not supported on
+        // this connection), log a warning and continue the pipeline normally.
+        if let Some(req) = ctx.req.as_mut() {
+            if let Err(e) = zincio_http::send_early_hints(req, headers).await {
+                ctx.events.emit(Event::Log(LogEvent {
+                    level: LogLevel::Warn,
+                    target: LOG_TARGET,
+                    message: format!("Failed to send 103 Early Hints: {e}"),
+                    summary: "Failed to send 103 Early Hints".into(),
+                    attributes: vec![("error.message", LogAttributeValue::String(e.to_string()))],
+                    trace_context: ferron_http::trace_context::current_event_trace_context(ctx),
+                }));
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferron_core::config::layer::LayeredConfiguration;
+    use ferron_core::config::{
+        ServerConfigurationBlock, ServerConfigurationDirectiveEntry, ServerConfigurationValue,
+    };
+    use ferron_observability::CompositeEventSink;
+    use http::Request;
+    use rustc_hash::FxHashMap;
+
+    fn make_value_number(n: i64) -> ServerConfigurationValue {
+        ServerConfigurationValue::Number(n, None)
+    }
+
+    fn make_value_string(s: &str) -> ServerConfigurationValue {
+        ServerConfigurationValue::String(s.to_string(), None)
+    }
+
+    fn make_value_bool(b: bool) -> ServerConfigurationValue {
+        ServerConfigurationValue::Boolean(b, None)
+    }
+
+    fn make_test_context_with_request(path: &str) -> HttpContext {
+        let req: ferron_http::HttpRequest = Request::builder()
+            .uri(path)
+            .body(
+                Empty::<Bytes>::new()
+                    .map_err(|e: std::convert::Infallible| match e {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+
+        let mut ctx = HttpContext::default();
+        ctx.req = Some(req);
+        ctx.events = CompositeEventSink::new(Vec::new());
+        ctx.configuration = LayeredConfiguration::default();
+        ctx.encrypted = false;
+        ctx.local_address = Some("0.0.0.0:80".parse().unwrap());
+        ctx.remote_address = Some("192.168.1.50:12345".parse().unwrap());
+        ctx
+    }
+
+    fn make_config_with_layer(
+        directives: FxHashMap<String, Vec<ServerConfigurationDirectiveEntry>>,
+    ) -> LayeredConfiguration {
+        let mut config = LayeredConfiguration::new();
+        config.add_layer(Arc::new(ServerConfigurationBlock {
+            directives: Arc::new(directives),
+            matchers: FxHashMap::default(),
+            span: None,
+        }));
+        config
+    }
+
+    fn make_child_block(
+        directives: Vec<(&str, Vec<ServerConfigurationDirectiveEntry>)>,
+    ) -> ServerConfigurationBlock {
+        let mut d = FxHashMap::default();
+        for (name, entries) in directives {
+            d.insert(name.to_string(), entries);
+        }
+        ServerConfigurationBlock {
+            directives: Arc::new(d),
+            matchers: FxHashMap::default(),
+            span: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_stops_pipeline() {
+        let engine = Arc::new(ResponseEngine::new());
+        let stage = HttpResponseStage::new(engine);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "abort".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_bool(true)],
+                children: None,
+                span: None,
+            }],
+        );
+
+        let mut ctx = make_test_context_with_request("/");
+        ctx.configuration = make_config_with_layer(directives);
+
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(!result, "abort should stop the pipeline");
+        assert!(matches!(ctx.res, Some(HttpResponse::Abort)));
+    }
+
+    #[tokio::test]
+    async fn no_abort_passes_through() {
+        let engine = Arc::new(ResponseEngine::new());
+        let stage = HttpResponseStage::new(engine);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "abort".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_bool(false)],
+                children: None,
+                span: None,
+            }],
+        );
+
+        let mut ctx = make_test_context_with_request("/");
+        ctx.configuration = make_config_with_layer(directives);
+
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(result, "non-abort should continue the pipeline");
+        assert!(ctx.res.is_none());
+    }
+
+    #[tokio::test]
+    async fn blocked_ip_gets_403() {
+        let engine = Arc::new(ResponseEngine::new());
+        let stage = HttpResponseStage::new(engine);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "block".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_string("192.168.1.0/24")],
+                children: None,
+                span: None,
+            }],
+        );
+
+        let mut ctx = make_test_context_with_request("/");
+        ctx.configuration = make_config_with_layer(directives);
+
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(!result, "blocked IP should stop the pipeline");
+        assert!(matches!(
+            ctx.res,
+            Some(HttpResponse::BuiltinError(403, None))
+        ));
+    }
+
+    #[tokio::test]
+    async fn allowed_ip_passes() {
+        let engine = Arc::new(ResponseEngine::new());
+        let stage = HttpResponseStage::new(engine);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "allow".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_string("192.168.1.0/24")],
+                children: None,
+                span: None,
+            }],
+        );
+
+        let mut ctx = make_test_context_with_request("/");
+        ctx.configuration = make_config_with_layer(directives);
+
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(result, "allowed IP should continue the pipeline");
+        assert!(ctx.res.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_without_body_returns_builtin_error() {
+        let engine = Arc::new(ResponseEngine::new());
+        let stage = HttpResponseStage::new(engine);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "status".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_number(503)],
+                children: None,
+                span: None,
+            }],
+        );
+
+        let mut ctx = make_test_context_with_request("/");
+        ctx.configuration = make_config_with_layer(directives);
+
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(!result, "status rule should stop the pipeline");
+        assert!(matches!(
+            ctx.res,
+            Some(HttpResponse::BuiltinError(503, None))
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_with_body_returns_custom_response() {
+        let engine = Arc::new(ResponseEngine::new());
+        let stage = HttpResponseStage::new(engine);
+
+        let child = make_child_block(vec![(
+            "body",
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_string("Service Unavailable")],
+                children: None,
+                span: None,
+            }],
+        )]);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "status".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_number(503)],
+                children: Some(child),
+                span: None,
+            }],
+        );
+
+        let mut ctx = make_test_context_with_request("/");
+        ctx.configuration = make_config_with_layer(directives);
+
+        let result = stage.run(&mut ctx).await.unwrap();
+        assert!(!result);
+        if let Some(HttpResponse::Custom(response)) = ctx.res {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        } else {
+            panic!("Expected custom response with body");
+        }
+    }
+
+    #[tokio::test]
+    async fn status_url_match_exact() {
+        let engine = Arc::new(ResponseEngine::new());
+        let stage = HttpResponseStage::new(engine);
+
+        let child = make_child_block(vec![(
+            "url",
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_string("/secret")],
+                children: None,
+                span: None,
+            }],
+        )]);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "status".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_number(403)],
+                children: Some(child),
+                span: None,
+            }],
+        );
+
+        // Should match
+        let mut ctx = make_test_context_with_request("/secret");
+        ctx.configuration = make_config_with_layer(directives.clone());
+        assert!(!stage.run(&mut ctx).await.unwrap());
+
+        // Should not match
+        let mut ctx2 = make_test_context_with_request("/other");
+        ctx2.configuration = make_config_with_layer(directives);
+        assert!(stage.run(&mut ctx2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn status_url_match_uses_routing_uri_not_req_uri() {
+        let engine = Arc::new(ResponseEngine::new());
+        let stage = HttpResponseStage::new(engine);
+
+        let child = make_child_block(vec![(
+            "url",
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_string("/canonical/secret")],
+                children: None,
+                span: None,
+            }],
+        )]);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "status".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_number(403)],
+                children: Some(child),
+                span: None,
+            }],
+        );
+
+        // req.uri() is "/rewritten/path" but routing_uri is "/canonical/secret"
+        // The rule should match based on routing_uri.
+        let mut ctx = make_test_context_with_request("/rewritten/path");
+        ctx.routing_uri = Some("/canonical/secret".parse().unwrap());
+        ctx.configuration = make_config_with_layer(directives);
+        assert!(!stage.run(&mut ctx).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn status_regex_match() {
+        let engine = Arc::new(ResponseEngine::new());
+        let stage = HttpResponseStage::new(engine);
+
+        let child = make_child_block(vec![(
+            "regex",
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_string("^/api/v[0-9]+")],
+                children: None,
+                span: None,
+            }],
+        )]);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "status".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_number(410)],
+                children: Some(child),
+                span: None,
+            }],
+        );
+
+        // Should match
+        let mut ctx = make_test_context_with_request("/api/v2/users");
+        ctx.configuration = make_config_with_layer(directives.clone());
+        assert!(!stage.run(&mut ctx).await.unwrap());
+
+        // Should not match
+        let mut ctx2 = make_test_context_with_request("/api/users");
+        ctx2.configuration = make_config_with_layer(directives);
+        assert!(stage.run(&mut ctx2).await.unwrap());
+    }
+
+    #[test]
+    fn rule_matches_without_url_or_regex() {
+        let rule = StatusRule {
+            status_code: 403,
+            name: None,
+            url: None,
+            regex: None,
+            location: None,
+            body: None,
+        };
+        // Should match any path
+        assert!(HttpResponseStage::rule_matches(&rule, "/anything").is_some());
+    }
+
+    #[test]
+    fn rule_matches_url_exact() {
+        let rule = StatusRule {
+            status_code: 404,
+            name: None,
+            url: Some("/missing".to_string()),
+            regex: None,
+            location: None,
+            body: None,
+        };
+        assert!(HttpResponseStage::rule_matches(&rule, "/missing").is_some());
+        assert!(HttpResponseStage::rule_matches(&rule, "/other").is_none());
+    }
+
+    #[test]
+    fn status_rule_name_is_parsed() {
+        let engine = Arc::new(ResponseEngine::new());
+        let child = make_child_block(vec![(
+            "name",
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_string("gone")],
+                children: None,
+                span: None,
+            }],
+        )]);
+
+        let mut directives = FxHashMap::default();
+        directives.insert(
+            "status".to_string(),
+            vec![ServerConfigurationDirectiveEntry {
+                args: vec![make_value_number(410)],
+                children: Some(child),
+                span: None,
+            }],
+        );
+
+        let config = ResponseConfig::from_config(&make_config_with_layer(directives), &engine);
+        assert_eq!(config.status_rules.len(), 1);
+        assert_eq!(config.status_rules[0].name.as_deref(), Some("gone"));
+    }
+
+    #[test]
+    fn rule_id_prefers_explicit_name() {
+        let rule = StatusRule {
+            status_code: 410,
+            name: Some("api-v1-deprecated".to_string()),
+            url: None,
+            regex: None,
+            location: None,
+            body: None,
+        };
+        assert_eq!(HttpResponseStage::rule_id(&rule, 0), "api-v1-deprecated");
+    }
+
+    #[test]
+    fn rule_id_falls_back_to_code_and_position() {
+        let rule = StatusRule {
+            status_code: 410,
+            name: None,
+            url: Some("/old".to_string()),
+            regex: None,
+            location: None,
+            body: None,
+        };
+        // 1-based position among evaluated rules; distinct per rule even when
+        // the status code is the same.
+        assert_eq!(HttpResponseStage::rule_id(&rule, 0), "status-410-rule-1");
+        assert_eq!(HttpResponseStage::rule_id(&rule, 1), "status-410-rule-2");
+    }
+
+    #[test]
+    fn rule_id_ignores_empty_name() {
+        let rule = StatusRule {
+            status_code: 403,
+            name: Some(String::new()),
+            url: None,
+            regex: None,
+            location: None,
+            body: None,
+        };
+        assert_eq!(HttpResponseStage::rule_id(&rule, 2), "status-403-rule-3");
+    }
+}
